@@ -1,0 +1,21 @@
+[project]
+name = "processor"
+version = "0.1.0"
+description = "PDF Processor"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiofiles>=25.1.0",
+    "core-db>=0.1.0",
+    "docling[rapidocr,tesserocr,vlm]>=2.80.0",
+    "pymupdf>=1.27.2",
+    "pymupdf4llm>=1.27.2.1",
+    "sqlmodel>=0.0.37",
+    "tenacity>=9.1.4",
+]
+
+
+[tool.uv.sources]
+core_db = {path = "../project/core_db", editable = true}
+
+
