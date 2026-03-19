@@ -12,6 +12,7 @@ dependencies = [
     "pymupdf4llm>=1.27.2.1",
     "sqlmodel>=0.0.37",
     "tenacity>=9.1.4",
+    "tesserocr>=2.10.0",
 ]
 
 

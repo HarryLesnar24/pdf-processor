@@ -1,5 +1,6 @@
 import os
 import sys
+import docling.document_converter
 import pymupdf
 import pymupdf.layout
 import pymupdf4llm
@@ -20,6 +21,8 @@ from docling.datamodel.pipeline_options import (
     RapidOcrOptions,
     OcrOptions,
     TesseractOcrOptions,
+    LayoutOptions
+
 )
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.accelerator_options import AcceleratorOptions, AcceleratorDevice
@@ -38,14 +41,14 @@ import logging
 #     accelerator_options=AcceleratorOptions(
 #         device=AcceleratorDevice.CUDA, cuda_use_flash_attention2=False
 #     ),
-#     do_ocr=True,
-#     table_structure_options=TableStructureOptions(
-#         mode=TableFormerMode.ACCURATE, do_cell_matching=False
+#     do_ocr=False,
+#      table_structure_options=TableStructureOptions(
+#          mode=TableFormerMode.ACCURATE, do_cell_matching=False
 #     ),
 #     code_formula_options=CodeFormulaVlmOptions.from_preset("codeformulav2"),
-#     do_formula_enrichment=True,
-#     # do_code_enrichment=True,
-#     do_table_structure=True,
+#     do_formula_enrichment=False,
+#     do_code_enrichment=False,
+#     do_table_structure=False,
 #     ocr_batch_size=4,
 #     layout_batch_size=4,
 #     table_batch_size=4,
@@ -68,7 +71,7 @@ import logging
 
 # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
 # result = doc_converter.convert(
-#     "docling-preview/C Sharp in Depth.pdf", page_range=(75, 87)
+#     "C Sharp in Depth.pdf", page_range=(75, 87)
 # )
 
 # with open('docling-preview/list-3.txt', 'w', encoding='utf-8') as f:
@@ -78,7 +81,7 @@ import logging
 
 # if isinstance(item, TextItem):
 #     print(item.get_ref())
-#     print(f'Label {item.label} Page no: {item.prov[0].page_no}')
+#      print(f'Label {item.label} Prov: {item.prov[0].page_no}') # type: ignore
 #     print(item.hyperlink)
 #     print('*' * 45)
 
@@ -130,31 +133,66 @@ import logging
 #     return "\n\n".join(md_lines)
 
 
-print(dir(Job))
 
 
 
 class PdfProcessor: 
 
     def __init__(self):
-        self.enrichedPages = set()
+        self.enrichPages = set()
 
-    def layoutAnalyzer(self, file: BinaryIO, session: AsyncSession):
+    async def layoutAnalyzer(self, file: BinaryIO, session: AsyncSession):
+        layout_options = ThreadedPdfPipelineOptions(
+            accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
+            do_table_structure=False,
+            do_ocr=False,
+            layout_batch_size=8
+        )
+        layout_analyser = DocumentConverter(
+
+            format_options={
+                InputFormat.PDF : PdfFormatOption(
+                    pipeline_options=layout_options,
+                    backend=DoclingParseDocumentBackend
+                )
+            }
+        )
+
+        async with session.begin():
+            ...
+
+    
+    async def pageExtractor(self, session: AsyncSession):
         ...
     
-    def pageExtractor(self):
+    async def enrichedPageExtractor(self, session: AsyncSession):
+        enrich_options = ThreadedPdfPipelineOptions(
+            accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
+            do_table_structure=True,
+            do_formula_enrichment=True,
+            do_ocr=True,
+            code_formula_options=CodeFormulaVlmOptions.from_preset('codeformulav2'),
+            ocr_options=TesseractOcrOptions(lang=['eng', 'equ']),
+            table_structure_options=TableStructureOptions(mode=TableFormerMode.ACCURATE, do_cell_matching=False)
+
+        )
+
+        enrich_converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF : PdfFormatOption(
+                    backend=DoclingParseDocumentBackend,
+                    pipeline_options=enrich_options
+                )
+            }
+        )
+    
+    async def chunker(self, session: AsyncSession):
         ...
     
-    def enrichedPageExtractor(self):
-        ...
-    
-    def chunker(self):
-        ...
-    
-    def embedder(self):
+    async def embedder(self, session: AsyncSession):
         ...
 
-    def processor(self, job: Job, filepath: str, session: AsyncSession):
+    async def processor(self, job: Job, filepath: str, session: AsyncSession):
         ...
     
 
