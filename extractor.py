@@ -1,16 +1,26 @@
+from multiprocessing import connection
 import os
+from quopri import encodestring
 import sys
+from pathlib import Path
 import docling.document_converter
 import pymupdf
+from dotenv import load_dotenv
 import pymupdf.layout
 import pymupdf4llm
 import docling
-import torch
+# import torch
+from sqlalchemy import func
 from typing import BinaryIO
-from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio.session import AsyncSession
+from sqlmodel import text
 from core_db.models.job import Job
+from core_db.models.page import Page
+from core_db.schemas.page import PageIndexEnum, PageStatusEnum
 
 from docling.datamodel import pipeline_options, pipeline_options_vlm_model
+from docling_core.types.io import DocumentStream
 from docling_core.types.doc.document import TextItem, CodeItem, FormulaItem
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.pipeline_options import (
@@ -32,6 +42,7 @@ from docling.backend.docling_parse_backend import (
     DoclingParsePageBackend,
 )
 from docling.pipeline.threaded_standard_pdf_pipeline import ThreadedStandardPdfPipeline
+from collections import defaultdict
 import logging
 
 # print(torch.__version__)
@@ -132,16 +143,17 @@ import logging
 #         # Handle other item types...
 #     return "\n\n".join(md_lines)
 
+load_dotenv()
 
-
+GPU_LOCK = os.getenv('GPU_ID')
 
 
 class PdfProcessor: 
 
-    def __init__(self):
-        self.enrichPages = set()
+    async def imageExtractor(self):
+        ...
 
-    async def layoutAnalyzer(self, file: BinaryIO, session: AsyncSession):
+    async def layoutAnalyzer(self, filePath: Path, job: Job, session: AsyncSession):
         layout_options = ThreadedPdfPipelineOptions(
             accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
             do_table_structure=False,
@@ -158,11 +170,79 @@ class PdfProcessor:
             }
         )
 
+        enrichPages = set()
+        analyzedPages = {}
+        imgBbox = defaultdict(list)
+        await session.execute(text(f'SELECT pg_advisory_lock({GPU_LOCK})'))
+        try:
+            layout_analyser.initialize_pipeline(InputFormat.PDF)
+            doc = layout_analyser.convert(filePath, page_range=(job.page_start + 1, job.page_end + 1))
+            for item, _ in doc.document.iterate_items():
+                page_no = item.prov[0].page_no # type: ignore
+                label = item.label # type: ignore
+                if page_no not in analyzedPages:
+                        analyzedPages[page_no] = {
+                            "page_no": page_no,
+                            "book_uid": job.book_uid,
+                            "user_uid": job.user_uid,
+                            "index": PageIndexEnum.analyzed,
+                            "required_deep": False
+                        }
+                if label == "picture":
+                    imgBbox[page_no].append(item.prov[0].bbox) # type: ignore
+                    analyzedPages[page_no]["required_deep"] = True
+                    analyzedPages[page_no]["has_image"] = True
+                elif label == "table":
+                    analyzedPages[page_no]["has_table"] = True
+                    analyzedPages[page_no]["required_deep"] = True
+                elif label == "formula":
+                    analyzedPages[page_no]["has_formula"] = True
+                    analyzedPages[page_no]["required_deep"] = True
+                elif label == "code":
+                    analyzedPages[page_no]["has_code"] = True
+
+                if analyzedPages[page_no]["required_deep"]:
+                        enrichPages.add(page_no)
+
+            batchData = []
+            for data in analyzedPages.values():
+                    newPage = Page(**data)
+                    batchData.append(newPage.model_dump())
+        
+        finally:
+                try:
+                    await session.execute(text(f"SELECT pg_advisory_unlock({GPU_LOCK})"))
+                except Exception as e:
+                    pass
+
+        
+        stmt = pg_insert(Page)
+        stmtHandleConflict = stmt.on_conflict_do_update(
+                constraint="uq_book_page",
+                set_={
+                    "index": stmt.excluded.index,
+                    "required_deep": stmt.excluded.required_deep,
+                    "has_image": stmt.excluded.has_image,
+                    "has_table": stmt.excluded.has_table,
+                    "has_code": stmt.excluded.has_code,
+                    "has_formula": stmt.excluded.has_formula,
+                    "status": stmt.excluded.status,
+                    "img_path": stmt.excluded.img_path,
+                    "updated_at": func.now()
+                }
+        ).returning(Page)
         async with session.begin():
-            ...
+            if batchData:
+                result = await session.execute(stmtHandleConflict, batchData)
+                upserted_pages = result.scalars().all()
+                return upserted_pages, enrichPages, imgBbox
+
+
+            
 
     
     async def pageExtractor(self, session: AsyncSession):
+
         ...
     
     async def enrichedPageExtractor(self, session: AsyncSession):

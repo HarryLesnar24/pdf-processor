@@ -82,18 +82,22 @@ async def hydrator(session: AsyncSession, worker_id: str):
     jobs = result.scalars().all()
     return jobs
 
+async def downloadFile(path: str):
+    # temporary 
+    ...
+
 
 async def worker(session: AsyncSession, container_id: str):
-    initialTime = 60
+    waitingTime = 60
     localQueue = {}
     while True:
         try:
             assignedJobs = await hydrator(session, container_id)
-            if initialTime > 60:
-                initialTime = 60
+            if waitingTime > 60:
+                waitingTime = 60
         except RetryError:
-            await asyncio.sleep(initialTime)
-            initialTime *= 2
+            await asyncio.sleep(waitingTime)
+            waitingTime *= 2
             continue
 
         for job in assignedJobs:
