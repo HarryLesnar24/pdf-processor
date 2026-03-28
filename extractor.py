@@ -1,3 +1,4 @@
+import asyncio
 from multiprocessing import connection
 import os
 from quopri import encodestring
@@ -43,6 +44,7 @@ from docling.backend.docling_parse_backend import (
 )
 from docling.pipeline.threaded_standard_pdf_pipeline import ThreadedStandardPdfPipeline
 from collections import defaultdict
+from worker import asyncEngine
 import logging
 
 # print(torch.__version__)
@@ -150,8 +152,31 @@ GPU_LOCK = os.getenv('GPU_ID')
 
 class PdfProcessor: 
 
-    async def imageExtractor(self):
-        ...
+    def __imageExtractor(self, filePath: Path, imgbbox: dict, pagesState: dict):
+        doc = pymupdf.open(filePath)
+
+        for page_no, bboxes in imgbbox.items():
+             page = doc[page_no - 1]
+
+             extractedPaths = []
+
+             for idx, bbox in enumerate(bboxes):
+                  rect = pymupdf.Rect(bbox.l, bbox.t, bbox.r, bbox.b)
+
+                  pix = page.get_pixmap(clip=rect, dpi=300)
+
+                  img_filename = f"{pagesState[page_no]['book_uid']}_page_{page_no}_img_{idx}.png"
+                  img_filepath = Path("tmp") / img_filename
+
+                  pix.save(str(img_filepath))
+
+                  extractedPaths.append(str(img_filepath))
+
+             pagesState[page_no]['img_path'] = extractedPaths
+
+        doc.close()
+
+
 
     async def layoutAnalyzer(self, filePath: Path, job: Job, session: AsyncSession):
         layout_options = ThreadedPdfPipelineOptions(
@@ -173,47 +198,53 @@ class PdfProcessor:
         enrichPages = set()
         analyzedPages = {}
         imgBbox = defaultdict(list)
-        await session.execute(text(f'SELECT pg_advisory_lock({GPU_LOCK})'))
-        try:
-            layout_analyser.initialize_pipeline(InputFormat.PDF)
-            doc = layout_analyser.convert(filePath, page_range=(job.page_start + 1, job.page_end + 1))
-            for item, _ in doc.document.iterate_items():
-                page_no = item.prov[0].page_no # type: ignore
-                label = item.label # type: ignore
-                if page_no not in analyzedPages:
-                        analyzedPages[page_no] = {
-                            "page_no": page_no,
-                            "book_uid": job.book_uid,
-                            "user_uid": job.user_uid,
-                            "index": PageIndexEnum.analyzed,
-                            "required_deep": False
-                        }
-                if label == "picture":
-                    imgBbox[page_no].append(item.prov[0].bbox) # type: ignore
-                    analyzedPages[page_no]["required_deep"] = True
-                    analyzedPages[page_no]["has_image"] = True
-                elif label == "table":
-                    analyzedPages[page_no]["has_table"] = True
-                    analyzedPages[page_no]["required_deep"] = True
-                elif label == "formula":
-                    analyzedPages[page_no]["has_formula"] = True
-                    analyzedPages[page_no]["required_deep"] = True
-                elif label == "code":
-                    analyzedPages[page_no]["has_code"] = True
+        async with asyncEngine.connect() as lock_conn:
+            await lock_conn.execute(text(f'SELECT pg_advisory_lock({GPU_LOCK})'))
+            try:
+                layout_analyser.initialize_pipeline(InputFormat.PDF)
+                doc = layout_analyser.convert(filePath, page_range=(job.page_start + 1, job.page_end + 1))
+                for item, _ in doc.document.iterate_items():
+                    page_no = item.prov[0].page_no # type: ignore
+                    label = item.label # type: ignore
+                    if page_no not in analyzedPages:
+                            analyzedPages[page_no] = {
+                                "page_no": page_no,
+                                "book_uid": job.book_uid,
+                                "user_uid": job.user_uid,
+                                "index": PageIndexEnum.analyzed,
+                                "required_deep": False
+                            }
+                    if label == "picture":
+                        imgBbox[page_no].append(item.prov[0].bbox) # type: ignore
+                        analyzedPages[page_no]["required_deep"] = True
+                        analyzedPages[page_no]["has_image"] = True
+                    elif label == "table":
+                        analyzedPages[page_no]["has_table"] = True
+                        analyzedPages[page_no]["required_deep"] = True
+                    elif label == "formula":
+                        analyzedPages[page_no]["has_formula"] = True
+                        analyzedPages[page_no]["required_deep"] = True
+                    elif label == "code":
+                        analyzedPages[page_no]["has_code"] = True
 
-                if analyzedPages[page_no]["required_deep"]:
-                        enrichPages.add(page_no)
-
-            batchData = []
-            for data in analyzedPages.values():
-                    newPage = Page(**data)
-                    batchData.append(newPage.model_dump())
+                    if analyzedPages[page_no]["required_deep"]:
+                            enrichPages.add(page_no)
+            
+            finally:
+                    try:
+                        await lock_conn.execute(text(f"SELECT pg_advisory_unlock({GPU_LOCK})"))
+                    except Exception as e:
+                        pass
         
-        finally:
-                try:
-                    await session.execute(text(f"SELECT pg_advisory_unlock({GPU_LOCK})"))
-                except Exception as e:
-                    pass
+        if imgBbox:
+             await asyncio.to_thread(self.__imageExtractor, filePath, imgBbox, analyzedPages)
+             
+             
+    
+        batchData = []
+        for data in analyzedPages.values():
+                newPage = Page(**data)
+                batchData.append(newPage.model_dump())
 
         
         stmt = pg_insert(Page)
@@ -235,7 +266,7 @@ class PdfProcessor:
             if batchData:
                 result = await session.execute(stmtHandleConflict, batchData)
                 upserted_pages = result.scalars().all()
-                return upserted_pages, enrichPages, imgBbox
+                return upserted_pages, enrichPages
 
 
             
