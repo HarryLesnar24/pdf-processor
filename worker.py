@@ -5,6 +5,7 @@ import socket
 import asyncio
 import aiofiles
 from pathlib import Path
+from core_db.schemas.task import TaskStatusEnum
 from core_db.models.job import Job
 from core_db.models.book import Book
 from sqlalchemy import text, select
@@ -69,7 +70,7 @@ async def hydrator(session: AsyncSession, worker_id: str):
             )
             UPDATE jobs
             SET 
-                task_status = 'processing',
+                task_status = :task,
                 locked_by = :worker_id,
                 locked_at = NOW(),
                 heartbeat_at = NOW()
@@ -77,7 +78,7 @@ async def hydrator(session: AsyncSession, worker_id: str):
             WHERE jobs.job_uid = selected_batch.job_uid
             RETURNING jobs.*;
 """)
-    stmt = select(Job).from_statement(query).params(worker_id=worker_id)
+    stmt = select(Job).from_statement(query).params(worker_id=worker_id, task=TaskStatusEnum.running)
     result = await session.execute(stmt)
     jobs = result.scalars().all()
     return jobs
@@ -105,6 +106,8 @@ async def worker(session: AsyncSession, container_id: str):
             result = await session.execute(stmt)
             row = result.first()
             filepath = row[0] if row else None
+            if not filepath:
+                continue
             if job.user_uid in localQueue:
                 heapq.heappush(
                     localQueue[job.user_uid],
@@ -116,3 +119,4 @@ async def worker(session: AsyncSession, container_id: str):
                     localQueue[job.user_uid],
                     (job.priority, job.job_type, filepath, job),
                 )
+                

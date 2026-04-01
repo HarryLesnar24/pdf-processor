@@ -6,13 +6,17 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "aiofiles>=25.1.0",
+    "chonkie[all]>=1.6.0",
     "core-db>=0.1.0",
     "docling[rapidocr,tesserocr,vlm]>=2.80.0",
+    "optimum[onnxruntime]>=2.1.0",
     "pymupdf>=1.27.2",
     "pymupdf4llm>=1.27.2.1",
+    "qdrant-client>=1.17.1",
     "sqlmodel>=0.0.37",
     "tenacity>=9.1.4",
     "tesserocr>=2.10.0",
+    "transformers>=4.57.6",
 ]
 
 

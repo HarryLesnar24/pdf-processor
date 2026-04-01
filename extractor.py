@@ -1,6 +1,7 @@
 import asyncio
 from multiprocessing import connection
 import os
+from typing import List
 from quopri import encodestring
 import sys
 from pathlib import Path
@@ -11,7 +12,7 @@ import pymupdf.layout
 import pymupdf4llm
 import docling
 # import torch
-from sqlalchemy import func
+from sqlalchemy import func, select, update
 from typing import BinaryIO
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio.session import AsyncSession
@@ -19,7 +20,7 @@ from sqlmodel import text
 from core_db.models.job import Job
 from core_db.models.page import Page
 from core_db.schemas.page import PageIndexEnum, PageStatusEnum
-
+from transformers import AutoTokenizer
 from docling.datamodel import pipeline_options, pipeline_options_vlm_model
 from docling_core.types.io import DocumentStream
 from docling_core.types.doc.document import TextItem, CodeItem, FormulaItem
@@ -35,6 +36,7 @@ from docling.datamodel.pipeline_options import (
     LayoutOptions
 
 )
+
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.accelerator_options import AcceleratorOptions, AcceleratorDevice
 from docling.datamodel.pipeline_options import ThreadedPdfPipelineOptions
@@ -42,8 +44,9 @@ from docling.backend.docling_parse_backend import (
     DoclingParseDocumentBackend,
     DoclingParsePageBackend,
 )
+from chonkie import MarkdownChef, Pipeline, CodeChunker, TableChunker, RecursiveChunker
 from docling.pipeline.threaded_standard_pdf_pipeline import ThreadedStandardPdfPipeline
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from worker import asyncEngine
 import logging
 
@@ -145,6 +148,13 @@ import logging
 #         # Handle other item types...
 #     return "\n\n".join(md_lines)
 
+# for item, level in conv_result.document.iterate_items():
+#     if isinstance(item, CodeItem):
+#         print(f"Language: {item.code_language}")
+#         print(f"Code: {item.text}")
+
+
+
 load_dotenv()
 
 GPU_LOCK = os.getenv('GPU_ID')
@@ -212,7 +222,11 @@ class PdfProcessor:
                                 "book_uid": job.book_uid,
                                 "user_uid": job.user_uid,
                                 "index": PageIndexEnum.analyzed,
-                                "required_deep": False
+                                "required_deep": False,
+                                "has_image": False,
+                                "has_table": False,
+                                "has_formula": False,
+                                "has_code": False,
                             }
                     if label == "picture":
                         imgBbox[page_no].append(item.prov[0].bbox) # type: ignore
@@ -226,6 +240,7 @@ class PdfProcessor:
                         analyzedPages[page_no]["required_deep"] = True
                     elif label == "code":
                         analyzedPages[page_no]["has_code"] = True
+                        analyzedPages[page_no]["required_deep"] = True
 
                     if analyzedPages[page_no]["required_deep"]:
                             enrichPages.add(page_no)
@@ -240,7 +255,6 @@ class PdfProcessor:
              await asyncio.to_thread(self.__imageExtractor, filePath, imgBbox, analyzedPages)
              
              
-    
         batchData = []
         for data in analyzedPages.values():
                 newPage = Page(**data)
@@ -266,7 +280,8 @@ class PdfProcessor:
             if batchData:
                 result = await session.execute(stmtHandleConflict, batchData)
                 upserted_pages = result.scalars().all()
-                return upserted_pages, enrichPages
+                return upserted_pages, sorted(enrichPages)
+            return [], []
 
 
             
@@ -276,11 +291,12 @@ class PdfProcessor:
 
         ...
     
-    async def enrichedPageExtractor(self, session: AsyncSession):
+    async def enrichedPageExtractor(self, session: AsyncSession, selectedPages: List[int], filePath: Path, jobs: Job):
         enrich_options = ThreadedPdfPipelineOptions(
             accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
             do_table_structure=True,
             do_formula_enrichment=True,
+            do_code_enrichment=True,
             do_ocr=True,
             code_formula_options=CodeFormulaVlmOptions.from_preset('codeformulav2'),
             ocr_options=TesseractOcrOptions(lang=['eng', 'equ']),
@@ -296,9 +312,40 @@ class PdfProcessor:
                 )
             }
         )
-    
-    async def chunker(self, session: AsyncSession):
-        ...
+
+        enrich_converter.initialize_pipeline(InputFormat.PDF)
+        md = OrderedDict()
+
+        await session.execute(
+                update(Page)
+                .where(Page.page_no.in_(selectedPages)) # type: ignore
+                .values(index=PageIndexEnum.deep)
+        )
+
+        await session.flush()
+
+        async with asyncEngine.connect() as lock_conn:
+            await lock_conn.execute(text(f'SELECT pg_advisory_lock({GPU_LOCK})'))
+            try:
+                for page_no in selectedPages:
+                    progLang = set()
+                    page = enrich_converter.convert(filePath, page_range=(page_no, page_no)).document
+                    for item, _ in page.iterate_items():
+                         if isinstance(item, CodeItem):
+                              progLang.add(item.code_language or 'txt')
+                    md[page_no] = (page.export_to_markdown(), list(progLang))
+            finally:
+                 await lock_conn.execute(text(f'SELECT pg_advisory_unlock({GPU_LOCK})'))
+            
+            return md
+ 
+
+    async def chunker(self, session: AsyncSession, pages: OrderedDict):
+        tokenizerModel = AutoTokenizer.from_pretrained("jinaai/jina-embeddings-v5-text-small-retrieval")
+        pipeline = Pipeline().process_with('markdown', tokenizer=tokenizerModel)
+        
+
+
     
     async def embedder(self, session: AsyncSession):
         ...
