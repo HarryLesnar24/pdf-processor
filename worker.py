@@ -20,6 +20,8 @@ from tenacity import (
     RetryError,
     AsyncRetrying,
 )
+from extractor import EmbeddingService, PdfProcessor
+
 
 
 asyncEngine = create_async_engine("postgresql+asyncpg://postgres@127.0.0.1:5432/appdb")
@@ -27,7 +29,7 @@ asyncSession = async_sessionmaker(
     bind=asyncEngine, class_=AsyncSession, expire_on_commit=False
 )
 containerID = socket.gethostname()
-
+EmbeddingService.initialize()
 
 @retry(
     retry=retry_if_result(lambda r: not r),

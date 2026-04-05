@@ -1,17 +1,24 @@
+from fileinput import filename
+import io
+from io import BytesIO
 import asyncio
 from multiprocessing import connection
 import os
-from typing import List
+from typing import List, Dict, Any
 from quopri import encodestring
 import sys
 from pathlib import Path
 import docling.document_converter
+from faker.proxy import OrderedDictType
 import pymupdf
 from dotenv import load_dotenv
 import pymupdf.layout
 import pymupdf4llm
+from pymupdf4llm.ocr import rapidtess_api
 import docling
-# import torch
+import torch
+import torch.nn.functional as F
+from qdrant_client.async_qdrant_client import AsyncQdrantClient
 from sqlalchemy import func, select, update
 from typing import BinaryIO
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -19,11 +26,12 @@ from sqlalchemy.ext.asyncio.session import AsyncSession
 from sqlmodel import text
 from core_db.models.job import Job
 from core_db.models.page import Page
+from core_db.models.chunk import Chunk
 from core_db.schemas.page import PageIndexEnum, PageStatusEnum
 from transformers import AutoTokenizer
 from docling.datamodel import pipeline_options, pipeline_options_vlm_model
 from docling_core.types.io import DocumentStream
-from docling_core.types.doc.document import TextItem, CodeItem, FormulaItem
+from docling_core.types.doc.document import ContentLayer, TextItem, CodeItem, FormulaItem
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.pipeline_options import (
     PdfPipelineOptions,
@@ -44,11 +52,13 @@ from docling.backend.docling_parse_backend import (
     DoclingParseDocumentBackend,
     DoclingParsePageBackend,
 )
-from chonkie import MarkdownChef, Pipeline, CodeChunker, TableChunker, RecursiveChunker
+from chonkie import MarkdownChef, Pipeline, CodeChunker, TableChunker, RecursiveChunker, Document, MarkdownDocument, RecursiveRules
 from docling.pipeline.threaded_standard_pdf_pipeline import ThreadedStandardPdfPipeline
 from collections import defaultdict, OrderedDict
 from worker import asyncEngine
+from optimum.onnxruntime import ORTModelForFeatureExtraction
 import logging
+
 
 # print(torch.__version__)
 
@@ -158,10 +168,65 @@ import logging
 load_dotenv()
 
 GPU_LOCK = os.getenv('GPU_ID')
+SPLIT_MARKER = "<!-- PAGE BREAK -->"
+EMBEDDING_MODEL = "jinaai/jina-embeddings-v5-text-small-retrieval"
+tokenizerModel = AutoTokenizer.from_pretrained(EMBEDDING_MODEL)
+
+class EmbeddingService:
+     _tokenizer = None
+     _model = None
+
+     @classmethod
+     def initialize(cls):
+          if cls._model is None:
+               cls._tokenizer = tokenizerModel
+
+               cls._model = ORTModelForFeatureExtraction.from_pretrained(
+                    EMBEDDING_MODEL,
+                    subfolder='onnx',
+                    file_name='model.onnx',
+                    provider="CPUExecutionProvider",
+                    trust_remote_code=True
+        )
+
+     @staticmethod     
+     def _run_inference(model, inputs):
+        with torch.no_grad():
+            return model(**inputs)
+            
+     @classmethod
+     async def batchEmbedding(cls, chunks: List[str]) -> List[List[float]]:
+        inputs = cls._tokenizer( 
+             chunks,
+             padding=True,
+             truncation=True,
+             return_tensors="pt"
+        ) # type: ignore
+
+    
+        outputs = await asyncio.to_thread(cls._run_inference, cls._model, inputs)
+        
+        last_hidden_state = outputs.last_hidden_state
+        sequence_lengths = inputs.attention_mask.sum(dim=1) - 1
+        pooled_embeddings = last_hidden_state[torch.arange(last_hidden_state.size(0)), sequence_lengths]
+
+        normalized_embeddings = F.normalize(pooled_embeddings, p=2, dim=1)
+        return normalized_embeddings.tolist()
 
 
 class PdfProcessor: 
 
+    def __enrichDocCreator(self, filePath: Path, pages: List[int]) -> BytesIO:
+         with pymupdf.open(filePath) as src, pymupdf.open() as doc:
+            for page in pages:
+                doc.insert_pdf(docsrc=src, from_page=page - 1, to_page=page - 1)
+            
+            buffer = io.BytesIO()
+            doc.save(buffer, garbage=1)
+
+            buffer.seek(0)
+            return buffer
+    
     def __imageExtractor(self, filePath: Path, imgbbox: dict, pagesState: dict):
         doc = pymupdf.open(filePath)
 
@@ -186,6 +251,12 @@ class PdfProcessor:
 
         doc.close()
 
+    def __textExtractor(self, filePath: Path, pages: List[int])-> List[Dict[str, Any]]:
+        doc = pymupdf.open(filePath)
+        markdownDict = pymupdf4llm.to_markdown(doc, ocr_function=rapidtess_api.exec_ocr, ocr_language="eng+equ", page_chunks=True, pages=pages)
+        doc.close()
+        # assert isinstance(markdownDict, List)
+        return markdownDict # type: ignore
 
 
     async def layoutAnalyzer(self, filePath: Path, job: Job, session: AsyncSession):
@@ -208,11 +279,11 @@ class PdfProcessor:
         enrichPages = set()
         analyzedPages = {}
         imgBbox = defaultdict(list)
-        async with asyncEngine.connect() as lock_conn:
+        async with asyncEngine.execution_options(isolation_level='AUTOCOMMIT').connect() as lock_conn:
             await lock_conn.execute(text(f'SELECT pg_advisory_lock({GPU_LOCK})'))
             try:
                 layout_analyser.initialize_pipeline(InputFormat.PDF)
-                doc = layout_analyser.convert(filePath, page_range=(job.page_start + 1, job.page_end + 1))
+                doc = await asyncio.to_thread(layout_analyser.convert, filePath, page_range=(job.page_start + 1, job.page_end + 1))
                 for item, _ in doc.document.iterate_items():
                     page_no = item.prov[0].page_no # type: ignore
                     label = item.label # type: ignore
@@ -283,14 +354,30 @@ class PdfProcessor:
                 return upserted_pages, sorted(enrichPages)
             return [], []
 
-
+    
+    async def pageExtractor(self, session: AsyncSession, pages: List[int], filePath: Path):
+        md = OrderedDict()
+        markdownDicts: List[Dict[str, Any]] = await asyncio.to_thread(self.__textExtractor, filePath, pages)
+        for page in markdownDicts:
+            if not page["text"].strip():
+                continue
+            removable = []
+            for box in page["page_boxes"]:
+                 if box["class"] == "picture" or box["class"] == "table" or box["class"] == "formula":
+                      removable.append(box["pos"])
             
+            if removable:
+                 result = []
+                 lastIndex = 0
+                 for start, end in removable:
+                      result.append(page["text"][lastIndex:start])
+                      lastIndex = end
+                 result.append(page["text"][lastIndex:])
+                 md[page["metadata"]["page_number"]] = "".join(result)
+            else:
+                 md[page["metadata"]["page_number"]] = page["text"]
+        return md
 
-    
-    async def pageExtractor(self, session: AsyncSession):
-
-        ...
-    
     async def enrichedPageExtractor(self, session: AsyncSession, selectedPages: List[int], filePath: Path, jobs: Job):
         enrich_options = ThreadedPdfPipelineOptions(
             accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
@@ -313,46 +400,84 @@ class PdfProcessor:
             }
         )
 
-        enrich_converter.initialize_pipeline(InputFormat.PDF)
         md = OrderedDict()
 
-        await session.execute(
-                update(Page)
-                .where(Page.page_no.in_(selectedPages)) # type: ignore
-                .values(index=PageIndexEnum.deep)
-        )
-
-        await session.flush()
-
-        async with asyncEngine.connect() as lock_conn:
+        pageMapper = {i + 1: actualNo for i, actualNo in enumerate(selectedPages)}
+        buff = await asyncio.to_thread(self.__enrichDocCreator, filePath, selectedPages)
+        stream = DocumentStream(name='temp.pdf', stream=buff)
+        async with asyncEngine.execution_options(isolation_level='AUTOCOMMIT').connect() as lock_conn:
             await lock_conn.execute(text(f'SELECT pg_advisory_lock({GPU_LOCK})'))
+            enrich_converter.initialize_pipeline(InputFormat.PDF)
             try:
-                for page_no in selectedPages:
-                    progLang = set()
-                    page = enrich_converter.convert(filePath, page_range=(page_no, page_no)).document
-                    for item, _ in page.iterate_items():
-                         if isinstance(item, CodeItem):
-                              progLang.add(item.code_language or 'txt')
-                    md[page_no] = (page.export_to_markdown(), list(progLang))
+                doc = await asyncio.to_thread(enrich_converter.convert, stream)
             finally:
                  await lock_conn.execute(text(f'SELECT pg_advisory_unlock({GPU_LOCK})'))
-            
-            return md
+        
+        codeMaps = defaultdict(list)
+
+        for item, _ in doc.document.iterate_items():
+                if isinstance(item, CodeItem): # type: ignore
+                    page = item.prov[0].page_no
+                    codeMaps[pageMapper[page]].append({
+                        "language": item.code_language or "txt",
+                        "content": item.text or None,
+                        "bbox": item.prov[0].bbox
+                    })
+
+        markdownFile = doc.document.export_to_markdown(page_break_placeholder=SPLIT_MARKER)
+        pages = markdownFile.split(SPLIT_MARKER)
+
+        for page_no in range(1, len(doc.pages) + 1):
+                actualPageNo = pageMapper[page_no]
+                md[actualPageNo] = {
+                     "markdown": pages[page_no - 1],
+                     "code": codeMaps.get(actualPageNo, [])}
+               
+        buff.close()
+        return md
  
 
-    async def chunker(self, session: AsyncSession, pages: OrderedDict):
-        tokenizerModel = AutoTokenizer.from_pretrained("jinaai/jina-embeddings-v5-text-small-retrieval")
-        pipeline = Pipeline().process_with('markdown', tokenizer=tokenizerModel)
+    async def chunker(self, session: AsyncSession, pages: OrderedDict, job: Job, enrich: bool = False):
+        pipeline = Pipeline().process_with('markdown', tokenizer=tokenizerModel).chunk_with('recursive', chunk_size=800, tokenizer=tokenizerModel, rules=RecursiveRules()).refine_with('overlap', tokenizer=tokenizerModel, context_size=100, method='prefix')
         
+        for page_no, pageData in pages.items():
+             markdown = pageData['markdown']
+             codeBlocks = pageData['code']
+             if not markdown.strip():
+                  continue
+             
+             mdDoc = await pipeline.arun(markdown)
+
+             if isinstance(mdDoc, Document):
+                chunks = [chunk.text for chunk in mdDoc.chunks]
+                vectors = await EmbeddingService.batchEmbedding(chunks)
+                
+        
+        
+        # await session.execute(
+        #         update(Page)
+        #         .where(Page.page_no.in_(selectedPages)) # type: ignore
+        #         .values(index=PageIndexEnum.deep)
+        # )
+
+        # await session.flush()
+    
+   
 
 
     
-    async def embedder(self, session: AsyncSession):
-        ...
+    async def embedder(self, session: AsyncSession, chunk: str):
+        model = ...
+
+
+
+
 
     async def processor(self, job: Job, filepath: str, session: AsyncSession):
         ...
     
+
+
 
 
 
