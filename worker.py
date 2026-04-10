@@ -23,7 +23,6 @@ from tenacity import (
 from extractor import EmbeddingService, PdfProcessor
 
 
-
 asyncEngine = create_async_engine("postgresql+asyncpg://postgres@127.0.0.1:5432/appdb")
 asyncSession = async_sessionmaker(
     bind=asyncEngine, class_=AsyncSession, expire_on_commit=False
@@ -31,8 +30,8 @@ asyncSession = async_sessionmaker(
 containerID = socket.gethostname()
 EmbeddingService.initialize()
 
+
 @retry(
-    retry=retry_if_result(lambda r: not r),
     wait=wait_exponential_jitter(initial=1, max=900),
     stop=stop_after_attempt(10),
 )
@@ -80,13 +79,18 @@ async def hydrator(session: AsyncSession, worker_id: str):
             WHERE jobs.job_uid = selected_batch.job_uid
             RETURNING jobs.*;
 """)
-    stmt = select(Job).from_statement(query).params(worker_id=worker_id, task=TaskStatusEnum.running)
+    stmt = (
+        select(Job)
+        .from_statement(query)
+        .params(worker_id=worker_id, task=TaskStatusEnum.running)
+    )
     result = await session.execute(stmt)
     jobs = result.scalars().all()
     return jobs
 
+
 async def downloadFile(path: str):
-    # temporary 
+    # temporary
     ...
 
 
@@ -95,9 +99,10 @@ async def worker(session: AsyncSession, container_id: str):
     localQueue = {}
     while True:
         try:
-            assignedJobs = await hydrator(session, container_id)
-            if waitingTime > 60:
-                waitingTime = 60
+            async with asyncSession() as sess:
+                assignedJobs = await hydrator(sess, container_id)
+                if waitingTime > 60:
+                    waitingTime = 60
         except RetryError:
             await asyncio.sleep(waitingTime)
             waitingTime *= 2
@@ -121,4 +126,3 @@ async def worker(session: AsyncSession, container_id: str):
                     localQueue[job.user_uid],
                     (job.priority, job.job_type, filepath, job),
                 )
-                
