@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "aiofiles>=25.1.0",
+    "asyncpg>=0.31.0",
     "chonkie[all]>=1.6.0",
     "core-db>=0.1.0",
     "docling[rapidocr,tesserocr,vlm]>=2.80.0",
@@ -14,14 +15,23 @@ dependencies = [
     "pymupdf4llm>=1.27.2.1",
     "qdrant-client>=1.17.1",
     "rapidocr>=3.7.0",
+    "rapidocr-onnxruntime>=1.4.4",
     "sqlmodel>=0.0.37",
     "tenacity>=9.1.4",
     "tesserocr>=2.10.0",
+    "torch>=2.11.0",
     "transformers>=4.57.6",
+    "triton-windows>=3.6.0.post26",
 ]
 
 
 [tool.uv.sources]
-core_db = {path = "../project/core_db", editable = true}
+core_db = {path = "../core_db", editable = true}
+tesserocr = { path = "../../Downloads/tesserocr-2.10.0-cp313-cp313-win_amd64.whl" }
+torch = { index = "pytorch-cu128" } 
 
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 

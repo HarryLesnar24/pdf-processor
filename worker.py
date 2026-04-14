@@ -5,12 +5,13 @@ import socket
 import asyncio
 import aiofiles
 from pathlib import Path
+from collections import deque
+from core_db.schemas.job import JobPriorityEnum
 from core_db.schemas.task import TaskStatusEnum
 from core_db.models.job import Job
 from core_db.models.book import Book
 from sqlalchemy import text, select
 from sqlalchemy.ext.asyncio.session import AsyncSession
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from tenacity import (
     retry,
     wait_exponential_jitter,
@@ -21,17 +22,17 @@ from tenacity import (
     AsyncRetrying,
 )
 from extractor import EmbeddingService, PdfProcessor
+from session import asyncSession
 
 
-asyncEngine = create_async_engine("postgresql+asyncpg://postgres@127.0.0.1:5432/appdb")
-asyncSession = async_sessionmaker(
-    bind=asyncEngine, class_=AsyncSession, expire_on_commit=False
-)
+PRIORITY_ORDER = [JobPriorityEnum.urgent, JobPriorityEnum.high, JobPriorityEnum.low]
+
+
 containerID = socket.gethostname()
-EmbeddingService.initialize()
 
 
 @retry(
+    retry=retry_if_exception_type(Exception),
     wait=wait_exponential_jitter(initial=1, max=900),
     stop=stop_after_attempt(10),
 )
@@ -94,35 +95,76 @@ async def downloadFile(path: str):
     ...
 
 
-async def worker(session: AsyncSession, container_id: str):
+async def worker(container_id: str):
+    EmbeddingService.initialize()
+    print("Initialized Embedder")
     waitingTime = 60
     localQueue = {}
     while True:
         try:
-            async with asyncSession() as sess:
-                assignedJobs = await hydrator(sess, container_id)
-                if waitingTime > 60:
-                    waitingTime = 60
+            async with asyncSession() as session:
+                assignedJobs = await hydrator(session, container_id)
+                print("Hydrated Job")
+                await session.commit()
+
+            if not assignedJobs:
+                await asyncio.sleep(60)
+                continue
+            if waitingTime > 60:
+                waitingTime = 60
+
         except RetryError:
             await asyncio.sleep(waitingTime)
             waitingTime *= 2
             continue
+        book_ids = [job.book_uid for job in assignedJobs]
 
+        async with asyncSession() as session:
+            results = await session.execute(
+                select(Book.uid, Book.filepath).where(Book.uid.in_(book_ids)) # type: ignore
+            ) 
+            bookFileMap = {uid:path for uid, path in results.all()}
+            print("Mapped Book UID with Filepath")
         for job in assignedJobs:
-            stmt = select(Book.filepath).where(job.book_uid == Book.uid)  # type: ignore
-            result = await session.execute(stmt)
-            row = result.first()
-            filepath = row[0] if row else None
+            filepath = bookFileMap.get(job.book_uid)
             if not filepath:
                 continue
             if job.user_uid in localQueue:
-                heapq.heappush(
-                    localQueue[job.user_uid],
-                    (job.priority, job.job_type, filepath, job),
+                localQueue[job.user_uid][job.priority].append(
+                (job.job_type, filepath, job)
                 )
             else:
-                localQueue[job.user_uid] = []
-                heapq.heappush(
-                    localQueue[job.user_uid],
-                    (job.priority, job.job_type, filepath, job),
+                localQueue[job.user_uid] = {
+                    JobPriorityEnum.urgent: deque(),
+                    JobPriorityEnum.high: deque(),
+                    JobPriorityEnum.low: deque()
+                }
+            
+                localQueue[job.user_uid][job.priority].append(
+                (job.job_type, filepath, job)
                 )
+        print("LocalQueue Job Assigned")
+        
+        userQueue = deque(localQueue.keys())
+
+        pdfProcessor = PdfProcessor()
+
+        while userQueue:
+            userUid = userQueue.popleft()
+            print(f"Popped User: {userUid}")
+            for priority in PRIORITY_ORDER:
+                queue = localQueue[userUid][priority]
+
+                if queue:
+                    typeOfJob, path, jobObj = queue.popleft()
+                    print(f'Path {path}, {jobObj.job_uid}')
+                    await pdfProcessor.processor(jobObj, path)
+                    print("Completed Job")
+                    break
+            if any(localQueue[userUid].values()):
+                userQueue.append(userUid)
+
+
+if __name__=="__main__":
+    asyncio.run(worker(containerID))
+ 

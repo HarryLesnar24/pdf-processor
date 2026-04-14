@@ -14,7 +14,6 @@ import docling
 import torch
 import torch.nn.functional as F
 from sqlalchemy import func, select, update
-from typing import BinaryIO
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio.session import AsyncSession
 from sqlmodel import text
@@ -62,12 +61,18 @@ from chonkie import (
 )
 from docling.pipeline.threaded_standard_pdf_pipeline import ThreadedStandardPdfPipeline
 from collections import defaultdict, OrderedDict
-from worker import asyncEngine
+from session import asyncEngine, asyncSession
 from optimum.onnxruntime import ORTModelForFeatureExtraction
+from rapidocr_onnxruntime import RapidOCR
+from PIL import Image
+import tesserocr
+import aiofiles
 import logging
+import json
 
 load_dotenv()
 
+rapid_engine = RapidOCR()
 GPU_LOCK = os.getenv("GPU_ID")
 SPLIT_MARKER = "<!-- PAGE BREAK -->"
 EMBEDDING_MODEL = "jinaai/jina-embeddings-v5-text-small-retrieval"
@@ -115,6 +120,83 @@ class EmbeddingService:
 
 
 class PdfProcessor:
+
+    # def __ocr_handler(self, page: pymupdf.Page, **kwargs):
+    #     """
+    #     Custom OCR handler that replaces rapidtess_api.exec_ocr.
+    #     It intercepts the bounding boxes and clamps them to prevent Leptonica crashes.
+    #     """
+    #     # Get language from kwargs, defaulting to what you use in your textExtractor
+    #     lang = kwargs.get("language", "eng+equ") 
+        
+    #     # 1. Render the PDF page to a high-res image for OCR
+    #     dpi = 300
+    #     pix = page.get_pixmap(dpi=dpi)
+    #     img_width, img_height = pix.width, pix.height
+        
+    #     # 2. Get bounding box coordinates from RapidOCR
+    #     img_bytes = pix.tobytes("png")
+    #     ocr_result, _ = rapid_engine(img_bytes)
+        
+    #     if not ocr_result:
+    #         return # No text found on this page
+            
+    #     # 3. Setup Tesserocr and loop through the boxes safely
+    #     with tesserocr.PyTessBaseAPI(lang=lang) as tess_api:
+    #         img_pil = Image.frombytes("RGB", [img_width, img_height], pix.samples) # type: ignore
+    #         tess_api.SetImage(img_pil)
+            
+    #         for dt_box in ocr_result:
+    #             # dt_box format: [ [[x1,y1], [x2,y2], [x3,y3], [x4,y4]], "text", confidence ]
+    #             box_coords = dt_box[0]
+                
+    #             x_coords = [p[0] for p in box_coords]
+    #             y_coords = [p[1] for p in box_coords]
+                
+    #             left = int(min(x_coords))
+    #             top = int(min(y_coords))
+    #             right = int(max(x_coords))
+    #             bottom = int(max(y_coords))
+                
+    #             # --- THE FIX: CLAMP COORDINATES TO IMAGE BOUNDS ---
+    #             left = max(0, min(left, img_width - 1))
+    #             top = max(0, min(top, img_height - 1))
+    #             right = max(0, min(right, img_width))
+    #             bottom = max(0, min(bottom, img_height))
+                
+    #             width = right - left
+    #             height = bottom - top
+                
+    #             # Skip invalid or 0-pixel boxes
+    #             if width <= 0 or height <= 0:
+    #                 continue
+                    
+    #             # 4. Extract Text with Tesseract using the safe rectangle
+    #             tess_api.SetRectangle(left, top, width, height)
+    #             text = tess_api.GetUTF8Text().strip()
+                
+    #             if text:
+    #                 # 5. Map coordinates back from the 300 DPI image to the PDF's point system (72 DPI)
+    #                 scale_x = page.rect.width / img_width
+    #                 scale_y = page.rect.height / img_height
+                    
+    #                 pdf_rect = pymupdf.Rect(
+    #                     left * scale_x, 
+    #                     top * scale_y, 
+    #                     right * scale_x, 
+    #                     bottom * scale_y
+    #                 )
+                    
+    #                 # 6. Inject the text invisibly into the PDF page 
+    #                 # render_mode=3 makes it an invisible, searchable text layer so pymupdf4llm can read it
+    #                 fontsize = max(4, pdf_rect.height * 0.8) # Approximate font size based on box height
+    #                 page.insert_text(
+    #                     pymupdf.Point(pdf_rect.x0, pdf_rect.y1), # Bottom-left of the bounding box
+    #                     text, 
+    #                     fontsize=fontsize,
+    #                     render_mode=3 
+    #                 )
+    
     def __enrichDocCreator(self, filePath: Path, pages: List[int]) -> BytesIO:
         with pymupdf.open(filePath) as src, pymupdf.open() as doc:
             for page in pages:
@@ -132,13 +214,15 @@ class PdfProcessor:
         for page_no, bboxes in imgbbox.items():
             page = doc[page_no - 1]
 
+            pageHeight = page.rect.height
             extractedPaths = []
 
             for idx, bbox in enumerate(bboxes):
                 TaborImg = 'image'
-
-                rect = pymupdf.Rect(bbox.l, bbox.t, bbox.r, bbox.b)
-
+                topNew = pageHeight - bbox.t
+                bottomNew = pageHeight - bbox.b
+                rect = pymupdf.Rect(bbox.l, topNew, bbox.r, bottomNew)
+                rect.normalize()
                 pix = page.get_pixmap(clip=rect, dpi=300)
 
                 if table:
@@ -189,7 +273,7 @@ class PdfProcessor:
             accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
             do_table_structure=False,
             do_ocr=False,
-            layout_batch_size=8,
+            layout_batch_size=4,
         )
         layout_analyser = DocumentConverter(
             format_options={
@@ -214,9 +298,8 @@ class PdfProcessor:
                     filePath,
                     page_range=(job.page_start + 1, job.page_end + 1),
                 )
-                for item, _ in doc.document.iterate_items():
-                    page_no = item.prov[0].page_no  # type: ignore
-                    label = item.label  # type: ignore
+
+                for page_no in range(job.page_start + 1, job.page_end + 2):
                     if page_no not in analyzedPages:
                         analyzedPages[page_no] = {
                             "page_no": page_no,
@@ -229,6 +312,10 @@ class PdfProcessor:
                             "has_formula": False,
                             "has_code": False,
                         }
+                
+                for item, _ in doc.document.iterate_items():
+                    page_no = item.prov[0].page_no  # type: ignore
+                    label = item.label  # type: ignore
                     if label == "picture":
                         imgBbox[page_no].append(item.prov[0].bbox)  # type: ignore
                         analyzedPages[page_no]["required_deep"] = True
@@ -286,6 +373,7 @@ class PdfProcessor:
         ).returning(Page)
         if batchData:
             result = await session.execute(stmtHandleConflict, batchData)
+            await session.commit()
             upserted_pages = result.scalars().all()
             return upserted_pages, enrichPages
         return [], []
@@ -331,7 +419,7 @@ class PdfProcessor:
             do_code_enrichment=True,
             do_ocr=True,
             code_formula_options=CodeFormulaVlmOptions.from_preset("codeformulav2"),
-            ocr_options=TesseractOcrOptions(lang=["eng", "equ"]),
+            ocr_options=RapidOcrOptions(),
             table_structure_options=TableStructureOptions(
                 mode=TableFormerMode.ACCURATE, do_cell_matching=False
             ),
@@ -394,26 +482,23 @@ class PdfProcessor:
         pipeline = (
             Pipeline()
             .process_with("markdown", tokenizer=tokenizerModel)
-            
+            .chunk_with(
+                 "recursive",
+                 chunk_size=800,
+                 tokenizer=tokenizerModel,
+                 rules=RecursiveRules()
+            )
+            .refine_with(
+                "overlap", tokenizer=tokenizerModel, context_size=100, method="prefix"
+            )
         )
 
-        recursivePipeline = (
-                Pipeline()
-                 .chunk_with(
-                     "recursive",
-                     chunk_size=800,
-                     tokenizer=tokenizerModel,
-                     rules=RecursiveRules()
-                 )
-                 .refine_with(
-                    "overlap", tokenizer=tokenizerModel, context_size=100, method="prefix"
-                 )
-        )
 
         codeBlocks = None
 
         chunksObj = defaultdict(list)
 
+        localData = []
         for page_no, pageData in md.items():
             markdown = pageData["markdown"]
             if pageData["code"]:
@@ -435,11 +520,7 @@ class PdfProcessor:
                         codeChunks.extend(chunks)
 
             if isinstance(mdDoc, Document):
-                proseText = "\n\n".join([chunk.text for chunk in mdDoc.chunks])
-                chunks = []
-                if proseText.strip():
-                    processedDoc = await recursivePipeline.arun(proseText)
-                    chunks = [chunk.text for chunk in processedDoc.chunks] # type: ignore
+                chunks = [chunk.text for chunk in mdDoc.chunks]
 
                 if codeChunks:
                     chunks.extend(codeChunks)
@@ -458,9 +539,21 @@ class PdfProcessor:
                         chunk_data=chunk
                     ) # type: ignore
                     pgChunks.append(data)
-                stmt = pg_insert(Chunk)
+                    dictionary = {
+                        'Chunk:': chunk,
+                        'Vector:': vector
+                    }
+                    localData.append(dictionary)
+                    
+                stmt = pg_insert(Chunk).returning(Chunk)
                 res = await session.execute(stmt, pgChunks)
+
                 chunksObj[page_no].append(res.scalars().all())
+        async with aiofiles.open('chunk-vector.json', 'w', encoding='utf-8') as file:
+             jsonData = json.dumps(localData, indent= 4)
+             await file.write(jsonData)
+        await session.commit()   
+        return chunksObj
 
                 
                     
@@ -475,8 +568,9 @@ class PdfProcessor:
     async def embedder(self, session: AsyncSession, chunk: str):
         model = ...
 
-    async def processor(self, job: Job, filepath: Path, session: AsyncSession): 
-        pagesObj, enrichPageSelected = await self.layoutAnalyzer(filepath, job, session)
+    async def processor(self, job: Job, filepath: Path): 
+        async with asyncSession() as session:
+            pagesObj, enrichPageSelected = await self.layoutAnalyzer(filepath, job, session)
         normalPageSelected = []
         for num in range(job.page_start, job.page_end + 1):
             if num + 1 not in enrichPageSelected:
@@ -485,7 +579,8 @@ class PdfProcessor:
         enrichMd = await self.enrichedPageExtractor(sorted(enrichPageSelected), filepath)
         mergeItems = heapq.merge(textMd.items(), enrichMd.items(), key=lambda x: x[0])
         markdown = OrderedDict(mergeItems)
-        chunksObj = await self.chunker(session, markdown, job)
+        async with asyncSession() as session:
+            chunksObj = await self.chunker(session, markdown, job)
         
 
         

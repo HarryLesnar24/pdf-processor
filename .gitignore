@@ -11,3 +11,5 @@ wheels/
 processor.code-workspace
 books/
 .env
+tmp/
+chunk-vector.json
