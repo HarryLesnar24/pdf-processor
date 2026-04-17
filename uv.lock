@@ -776,6 +776,7 @@ dependencies = [
     { name = "edwh-uuid7" },
     { name = "email-validator" },
     { name = "pydantic" },
+    { name = "qdrant-client" },
     { name = "sqlmodel" },
 ]
 
@@ -784,6 +785,7 @@ requires-dist = [
     { name = "edwh-uuid7" },
     { name = "email-validator" },
     { name = "pydantic" },
+    { name = "qdrant-client", specifier = ">=1.17.1" },
     { name = "sqlmodel" },
 ]
 
@@ -3414,6 +3416,7 @@ dependencies = [
     { name = "chonkie", extra = ["all"] },
     { name = "core-db" },
     { name = "docling", extra = ["rapidocr", "tesserocr", "vlm"] },
+    { name = "hf-xet" },
     { name = "optimum", extra = ["onnxruntime"] },
     { name = "pymupdf" },
     { name = "pymupdf4llm" },
@@ -3435,6 +3438,7 @@ requires-dist = [
     { name = "chonkie", extras = ["all"], specifier = ">=1.6.0" },
     { name = "core-db", editable = "../core_db" },
     { name = "docling", extras = ["rapidocr", "tesserocr", "vlm"], specifier = ">=2.80.0" },
+    { name = "hf-xet", specifier = ">=1.4.2" },
     { name = "optimum", extras = ["onnxruntime"], specifier = ">=2.1.0" },
     { name = "pymupdf", specifier = ">=1.27.2" },
     { name = "pymupdf4llm", specifier = ">=1.27.2.1" },

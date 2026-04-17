@@ -1,9 +1,10 @@
 import io
+import re
 from io import BytesIO
 import asyncio
 import heapq
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Set, Optional, Sequence
 from pathlib import Path
 import pymupdf
 from dotenv import load_dotenv
@@ -21,6 +22,7 @@ from core_db.models.job import Job
 from core_db.models.page import Page
 from core_db.models.chunk import Chunk
 from core_db.schemas.page import PageIndexEnum, PageStatusEnum
+from core_db.vector.db import batchUpsert
 from transformers import AutoTokenizer
 from docling.datamodel import pipeline_options, pipeline_options_vlm_model
 from docling_core.types.io import DocumentStream
@@ -42,7 +44,7 @@ from docling.datamodel.pipeline_options import (
     LayoutOptions,
 )
 
-from docling.datamodel.base_models import InputFormat
+from docling.datamodel.base_models import InputFormat, ConversionStatus
 from docling.datamodel.accelerator_options import AcceleratorOptions, AcceleratorDevice
 from docling.datamodel.pipeline_options import ThreadedPdfPipelineOptions
 from docling.backend.docling_parse_backend import (
@@ -59,6 +61,7 @@ from chonkie import (
     MarkdownDocument,
     RecursiveRules,
 )
+from qdrant_client.async_qdrant_client import AsyncQdrantClient
 from docling.pipeline.threaded_standard_pdf_pipeline import ThreadedStandardPdfPipeline
 from collections import defaultdict, OrderedDict
 from session import asyncEngine, asyncSession
@@ -69,14 +72,25 @@ import tesserocr
 import aiofiles
 import logging
 import json
+import uuid
 
 load_dotenv()
 
-rapid_engine = RapidOCR()
+
+# rapid_engine = RapidOCR()
+QDRANT_HOST = os.getenv("QDRANT_HOST")
+QDRANT_PORT = os.getenv("QDRANT_PORT")
+VECTOR_COLLECTION = os.getenv("COLLECTION_NAME")
+APP_NAME = os.getenv("NAMESPACE_APP")
+assert QDRANT_HOST != None
+assert QDRANT_PORT != None 
+assert APP_NAME != None
+NAMESPACE_UID = uuid.uuid5(uuid.NAMESPACE_DNS, APP_NAME)
 GPU_LOCK = os.getenv("GPU_ID")
 SPLIT_MARKER = "<!-- PAGE BREAK -->"
 EMBEDDING_MODEL = "jinaai/jina-embeddings-v5-text-small-retrieval"
 tokenizerModel = AutoTokenizer.from_pretrained(EMBEDDING_MODEL)
+asynClient = AsyncQdrantClient(host=QDRANT_HOST, port=int(QDRANT_PORT))
 
 
 class EmbeddingService:
@@ -114,7 +128,7 @@ class EmbeddingService:
         pooled_embeddings = last_hidden_state[
             torch.arange(last_hidden_state.size(0)), sequence_lengths
         ]
-
+        pooled_embeddings = pooled_embeddings[:, :768]
         normalized_embeddings = F.normalize(pooled_embeddings, p=2, dim=1)
         return normalized_embeddings.tolist()
 
@@ -241,6 +255,7 @@ class PdfProcessor:
 
         doc.close()
 
+
     def __textExtractor(self, filePath: Path, pages: List[int]) -> List[Dict[str, Any]]:
         doc = pymupdf.open(filePath)
         markdownDict = pymupdf4llm.to_markdown(
@@ -264,9 +279,32 @@ class PdfProcessor:
         return [chunk.text for chunk in chunks]
     
     def __recursiveChunker(self, textBlock: str):
-        chunker = RecursiveChunker(tokenizer=tokenizerModel, chunk_size=800, )
+        chunker = RecursiveChunker(tokenizer=tokenizerModel, chunk_size=800, rules=RecursiveRules())
         chunks = chunker.chunk(textBlock)
         return [chunk.text for chunk in chunks]
+    
+    async def layoutMapper(self, doc, pagesMetaData: dict, imgBbox: defaultdict, tableBbox: defaultdict, failedPages: Optional[Set[int]] = None):
+        for item, _ in doc.document.iterate_items():
+                page_no = item.prov[0].page_no  # type: ignore
+
+                if failedPages and page_no in failedPages:
+                    continue
+                label = item.label  # type: ignore
+                if label == "picture":
+                    imgBbox[page_no].append(item.prov[0].bbox)  # type: ignore
+                    pagesMetaData[page_no]["required_deep"] = True
+                    pagesMetaData[page_no]["has_image"] = True
+                elif label == "table":
+                    tableBbox[page_no].append(item.prov[0].bbox) # type: ignore
+                    pagesMetaData[page_no]["has_table"] = True
+                    pagesMetaData[page_no]["required_deep"] = True
+                elif label == "formula":
+                    pagesMetaData[page_no]["has_formula"] = True
+                    pagesMetaData[page_no]["required_deep"] = True
+                elif label == "code":
+                    pagesMetaData[page_no]["has_code"] = True
+                    pagesMetaData[page_no]["required_deep"] = True
+
 
     async def layoutAnalyzer(self, filePath: Path, job: Job, session: AsyncSession):
         layout_options = ThreadedPdfPipelineOptions(
@@ -282,7 +320,7 @@ class PdfProcessor:
                 )
             }
         )
-
+        redoc = None
         enrichPages = set()
         analyzedPages = {}
         imgBbox = defaultdict(list)
@@ -293,46 +331,30 @@ class PdfProcessor:
             await lock_conn.execute(text(f"SELECT pg_advisory_lock({GPU_LOCK})"))
             try:
                 layout_analyser.initialize_pipeline(InputFormat.PDF)
+
                 doc = await asyncio.to_thread(
                     layout_analyser.convert,
                     filePath,
                     page_range=(job.page_start + 1, job.page_end + 1),
                 )
 
-                for page_no in range(job.page_start + 1, job.page_end + 2):
-                    if page_no not in analyzedPages:
-                        analyzedPages[page_no] = {
-                            "page_no": page_no,
-                            "book_uid": job.book_uid,
-                            "user_uid": job.user_uid,
-                            "index": PageIndexEnum.analyzed,
-                            "required_deep": False,
-                            "has_image": False,
-                            "has_table": False,
-                            "has_formula": False,
-                            "has_code": False,
-                        }
-                
-                for item, _ in doc.document.iterate_items():
-                    page_no = item.prov[0].page_no  # type: ignore
-                    label = item.label  # type: ignore
-                    if label == "picture":
-                        imgBbox[page_no].append(item.prov[0].bbox)  # type: ignore
-                        analyzedPages[page_no]["required_deep"] = True
-                        analyzedPages[page_no]["has_image"] = True
-                    elif label == "table":
-                        tableBbox[page_no].append(item.prov[0].bbox) # type: ignore
-                        analyzedPages[page_no]["has_table"] = True
-                        analyzedPages[page_no]["required_deep"] = True
-                    elif label == "formula":
-                        analyzedPages[page_no]["has_formula"] = True
-                        analyzedPages[page_no]["required_deep"] = True
-                    elif label == "code":
-                        analyzedPages[page_no]["has_code"] = True
-                        analyzedPages[page_no]["required_deep"] = True
+                failedPages: Set[int] = set()
 
-                    if analyzedPages[page_no]["required_deep"]:
-                        enrichPages.add(page_no)
+                if doc.status in (ConversionStatus.PARTIAL_SUCCESS, ConversionStatus.FAILURE):
+                    for error in doc.errors:
+                        match = re.search(r"pages? \[?(\d+)\]?", error.error_message, re.IGNORECASE)
+                        if match:
+                            pageNum = int(match.group(1))
+                            failedPages.add(pageNum)
+
+
+                if failedPages:
+                    pages = sorted(failedPages)
+                    redoc = await asyncio.to_thread(
+                        layout_analyser.convert,
+                        filePath,
+                        page_range=(pages[0], pages[-1])
+                    )
 
             finally:
                 try:
@@ -341,6 +363,32 @@ class PdfProcessor:
                     )
                 except Exception as e:
                     pass
+
+        for page_no in range(job.page_start + 1, job.page_end + 2):
+            if page_no not in analyzedPages:
+                analyzedPages[page_no] = {
+                    "page_no": page_no,
+                    "book_uid": job.book_uid,
+                    "user_uid": job.user_uid,
+                    "index": PageIndexEnum.analyzed,
+                    "required_deep": False,
+                    "has_image": False,
+                    "has_table": False,
+                    "has_formula": False,
+                    "has_code": False,
+                }
+                
+        if failedPages:
+            await self.layoutMapper(doc, analyzedPages, imgBbox, tableBbox, failedPages)
+            await self.layoutMapper(redoc, analyzedPages, imgBbox, tableBbox)
+        else:
+            await self.layoutMapper(doc, analyzedPages, imgBbox, tableBbox)
+
+        for page_no in range(job.page_start + 1, job.page_end + 2):
+            if analyzedPages[page_no]["required_deep"]:
+                enrichPages.add(page_no)
+                
+
 
         if imgBbox:
             await asyncio.to_thread(
@@ -477,7 +525,7 @@ class PdfProcessor:
         return md
 
     async def chunker(
-        self, session: AsyncSession, md: OrderedDict, job: Job
+        self, session: AsyncSession, md: OrderedDict, job: Job, pages: Sequence[Page]
     ):
         pipeline = (
             Pipeline()
@@ -493,13 +541,14 @@ class PdfProcessor:
             )
         )
 
-
+        assert VECTOR_COLLECTION != None
         codeBlocks = None
-
+        pagesMap = {page.page_no: page for page in pages}
         chunksObj = defaultdict(list)
-
-        localData = []
+        # localData = []
+        book_id = job.book_uid
         for page_no, pageData in md.items():
+            currentPage = pagesMap.get(page_no)
             markdown = pageData["markdown"]
             if pageData["code"]:
                 codeBlocks = pageData["code"]
@@ -524,12 +573,18 @@ class PdfProcessor:
 
                 if codeChunks:
                     chunks.extend(codeChunks)
+                
+                if not chunks: 
+                    continue
+
                 vectors = await EmbeddingService.batchEmbedding(chunks)
-                stmt = select(Page.uid).where(Page.page_no == page_no)  # type: ignore
+                stmt = select(Page.uid).where((Page.page_no == page_no) & (Page.book_uid == job.book_uid))  # type: ignore
                 result = await session.execute(stmt)
                 page_uid = result.scalar_one_or_none()
                 pgChunks = []
-                for index, (chunk, vector) in enumerate(zip(chunks, vectors)):
+                payloads = []
+                identifiers = []
+                for index, chunk in enumerate(chunks):
                     data = Chunk(
                         page_uid=page_uid,
                         book_uid=job.book_uid,
@@ -539,19 +594,31 @@ class PdfProcessor:
                         chunk_data=chunk
                     ) # type: ignore
                     pgChunks.append(data)
-                    dictionary = {
-                        'Chunk:': chunk,
-                        'Vector:': vector
+                session.add_all(pgChunks)
+                await session.flush()
+                
+                for index in range(len(pgChunks)):
+                    chunk = pgChunks[index]
+                    payload = {
+                        "user_uid": chunk.user_uid,
+                        "book_uid": chunk.book_uid,
+                        "page_uid": chunk.page_uid,
+                        "chunk_uid": chunk.chunk_id,
+                        "page_no": page_no,
+                        "chunk_index": index,
+                        "has_image": currentPage.has_image, # type: ignore
+                        "has_table": currentPage.has_table, # type: ignore
                     }
-                    localData.append(dictionary)
-                    
-                stmt = pg_insert(Chunk).returning(Chunk)
-                res = await session.execute(stmt, pgChunks)
+                    payloads.append(payload)
+                    template = f"{book_id}_page_{page_no}_chunk_{index}"
+                    identity = uuid.uuid5(NAMESPACE_UID, template)
+                    identifiers.append(identity)
 
-                chunksObj[page_no].append(res.scalars().all())
-        async with aiofiles.open('chunk-vector.json', 'w', encoding='utf-8') as file:
-             jsonData = json.dumps(localData, indent= 4)
-             await file.write(jsonData)
+                await batchUpsert(asynClient, collection=VECTOR_COLLECTION, identifiers=identifiers, payloads=payloads, vectors=vectors)
+                chunksObj[page_no].extend(pgChunks)
+        # async with aiofiles.open('chunk-vector-01.json', 'w', encoding='utf-8') as file:
+        #      jsonData = json.dumps(localData, indent= 4)
+        #      await file.write(jsonData)
         await session.commit()   
         return chunksObj
 
@@ -571,122 +638,17 @@ class PdfProcessor:
     async def processor(self, job: Job, filepath: Path): 
         async with asyncSession() as session:
             pagesObj, enrichPageSelected = await self.layoutAnalyzer(filepath, job, session)
-        normalPageSelected = []
-        for num in range(job.page_start, job.page_end + 1):
-            if num + 1 not in enrichPageSelected:
-                normalPageSelected.append(num)
-        textMd = await self.pageExtractor(normalPageSelected, filepath)
-        enrichMd = await self.enrichedPageExtractor(sorted(enrichPageSelected), filepath)
-        mergeItems = heapq.merge(textMd.items(), enrichMd.items(), key=lambda x: x[0])
-        markdown = OrderedDict(mergeItems)
-        async with asyncSession() as session:
-            chunksObj = await self.chunker(session, markdown, job)
-        
-
-        
-        
+        if pagesObj and enrichPageSelected:
+            normalPageSelected = []
+            for num in range(job.page_start, job.page_end + 1):
+                if num + 1 not in enrichPageSelected:
+                    normalPageSelected.append(num)
+            textMd = await self.pageExtractor(normalPageSelected, filepath)
+            enrichMd = await self.enrichedPageExtractor(sorted(enrichPageSelected), filepath)
+            mergeItems = heapq.merge(textMd.items(), enrichMd.items(), key=lambda x: x[0])
+            markdown = OrderedDict(mergeItems)
+            async with asyncSession() as session:
+                chunksObj = await self.chunker(session, markdown, job, pagesObj)
         
 
 
-
-
-
-
-
-# print(torch.__version__)
-
-
-# pipeline_options = ThreadedPdfPipelineOptions(
-#     accelerator_options=AcceleratorOptions(
-#         device=AcceleratorDevice.CUDA, cuda_use_flash_attention2=False
-#     ),
-#     do_ocr=False,
-#      table_structure_options=TableStructureOptions(
-#          mode=TableFormerMode.ACCURATE, do_cell_matching=False
-#     ),
-#     code_formula_options=CodeFormulaVlmOptions.from_preset("codeformulav2"),
-#     do_formula_enrichment=False,
-#     do_code_enrichment=False,
-#     do_table_structure=False,
-#     ocr_batch_size=4,
-#     layout_batch_size=4,
-#     table_batch_size=4,
-# )
-
-# doc_converter = DocumentConverter(
-#     format_options={
-#         InputFormat.PDF: PdfFormatOption(
-#             backend=DoclingParseDocumentBackend,
-#             pipeline_options=pipeline_options,
-#         )
-#     }
-# )
-
-# 3. Initialize the pipeline
-# doc_converter.initialize_pipeline(InputFormat.PDF)
-
-
-# 4. Convert your document
-
-# with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-# result = doc_converter.convert(
-#     "C Sharp in Depth.pdf", page_range=(75, 87)
-# )
-
-# with open('docling-preview/list-3.txt', 'w', encoding='utf-8') as f:
-# f.write(str(result.document.texts))
-
-# for item, level in result.document.iterate_items():
-
-# if isinstance(item, TextItem):
-#     print(item.get_ref())
-#      print(f'Label {item.label} Prov: {item.prov[0].page_no}') # type: ignore
-#     print(item.hyperlink)
-#     print('*' * 45)
-
-# print(f'{item.label} Page-No {item.prov[0].page_no}') # type: ignore
-# Access the converted content
-# with open("docling-preview/docling-test-8.md", "w", encoding="utf-8") as f:
-#     f.write(result.document.export_to_markdown())
-
-
-# from docling.document_converter import DocumentConverter
-# from docling_core.types.doc import PictureItem, PictureMeta, DescriptionMetaField
-
-# converter = DocumentConverter()
-# result = converter.convert("document.pdf")
-# doc = result.document
-
-# # Iterate and add captions from your API
-# for pic in doc.pictures:
-#     img = pic.get_image(doc) # Returns PIL Image
-#     if img is None:
-#         continue
-
-#     # Call your remote API
-#     caption = call_your_api(img)
-
-#     # Set the description
-#     if pic.meta is None:
-#         pic.meta = PictureMeta()
-#     pic.meta.description = DescriptionMetaField(text=caption)
-
-# def export_with_captions(doc):
-#     md_lines = []
-#     for item, level in doc.iterate_items():
-#         if isinstance(item, PictureItem):
-#             alt_text = "Image"
-#             if item.meta and item.meta.description:
-#                 alt_text = item.meta.description.text
-
-#             if item.image and item.image.uri:
-#                 md_lines.append(f"![{alt_text}]({item.image.uri})")
-#             else:
-#                 md_lines.append(f"<!-- {alt_text} -->")
-#         # Handle other item types...
-#     return "\n\n".join(md_lines)
-
-# for item, level in conv_result.document.iterate_items():
-#     if isinstance(item, CodeItem):
-#         print(f"Language: {item.code_language}")
-#         print(f"Code: {item.text}")

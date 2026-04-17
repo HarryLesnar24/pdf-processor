@@ -10,6 +10,7 @@ dependencies = [
     "chonkie[all]>=1.6.0",
     "core-db>=0.1.0",
     "docling[rapidocr,tesserocr,vlm]>=2.80.0",
+    "hf-xet>=1.4.2",
     "optimum[onnxruntime]>=2.1.0",
     "pymupdf>=1.27.2",
     "pymupdf4llm>=1.27.2.1",
