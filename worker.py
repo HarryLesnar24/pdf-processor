@@ -121,9 +121,9 @@ async def worker(container_id: str):
 
         async with asyncSession() as session:
             results = await session.execute(
-                select(Book.uid, Book.filepath).where(Book.uid.in_(book_ids)) # type: ignore
-            ) 
-            bookFileMap = {uid:path for uid, path in results.all()}
+                select(Book.uid, Book.filepath).where(Book.uid.in_(book_ids))  # type: ignore
+            )
+            bookFileMap = {uid: path for uid, path in results.all()}
             print("Mapped Book UID with Filepath")
         for job in assignedJobs:
             filepath = bookFileMap.get(job.book_uid)
@@ -131,20 +131,20 @@ async def worker(container_id: str):
                 continue
             if job.user_uid in localQueue:
                 localQueue[job.user_uid][job.priority].append(
-                (job.job_type, filepath, job)
+                    (job.job_type, filepath, job)
                 )
             else:
                 localQueue[job.user_uid] = {
                     JobPriorityEnum.urgent: deque(),
                     JobPriorityEnum.high: deque(),
-                    JobPriorityEnum.low: deque()
+                    JobPriorityEnum.low: deque(),
                 }
-            
+
                 localQueue[job.user_uid][job.priority].append(
-                (job.job_type, filepath, job)
+                    (job.job_type, filepath, job)
                 )
         print("LocalQueue Job Assigned")
-        
+
         userQueue = deque(localQueue.keys())
 
         pdfProcessor = PdfProcessor()
@@ -157,7 +157,7 @@ async def worker(container_id: str):
 
                 if queue:
                     typeOfJob, path, jobObj = queue.popleft()
-                    print(f'Path {path}, {jobObj.job_uid}')
+                    print(f"Path {path}, {jobObj.job_uid}")
                     await pdfProcessor.processor(jobObj, path)
                     print("Completed Job")
                     break
@@ -165,6 +165,5 @@ async def worker(container_id: str):
                 userQueue.append(userUid)
 
 
-if __name__=="__main__":
+if __name__ == "__main__":
     asyncio.run(worker(containerID))
- 

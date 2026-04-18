@@ -13,3 +13,4 @@ books/
 .env
 tmp/
 chunk-vector.json
+chunks-1706.json

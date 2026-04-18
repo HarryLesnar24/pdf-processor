@@ -1,4 +1,5 @@
 import io
+import gc
 import re
 from io import BytesIO
 import asyncio
@@ -13,6 +14,7 @@ import pymupdf4llm
 from pymupdf4llm.ocr import rapidtess_api
 import docling
 import torch
+from torch.cpu import is_available
 import torch.nn.functional as F
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -83,9 +85,10 @@ QDRANT_PORT = os.getenv("QDRANT_PORT")
 VECTOR_COLLECTION = os.getenv("COLLECTION_NAME")
 APP_NAME = os.getenv("NAMESPACE_APP")
 assert QDRANT_HOST != None
-assert QDRANT_PORT != None 
+assert QDRANT_PORT != None
 assert APP_NAME != None
 NAMESPACE_UID = uuid.uuid5(uuid.NAMESPACE_DNS, APP_NAME)
+OVERLAP_CHUNK_LIMIT = 400
 GPU_LOCK = os.getenv("GPU_ID")
 SPLIT_MARKER = "<!-- PAGE BREAK -->"
 EMBEDDING_MODEL = "jinaai/jina-embeddings-v5-text-small-retrieval"
@@ -134,83 +137,6 @@ class EmbeddingService:
 
 
 class PdfProcessor:
-
-    # def __ocr_handler(self, page: pymupdf.Page, **kwargs):
-    #     """
-    #     Custom OCR handler that replaces rapidtess_api.exec_ocr.
-    #     It intercepts the bounding boxes and clamps them to prevent Leptonica crashes.
-    #     """
-    #     # Get language from kwargs, defaulting to what you use in your textExtractor
-    #     lang = kwargs.get("language", "eng+equ") 
-        
-    #     # 1. Render the PDF page to a high-res image for OCR
-    #     dpi = 300
-    #     pix = page.get_pixmap(dpi=dpi)
-    #     img_width, img_height = pix.width, pix.height
-        
-    #     # 2. Get bounding box coordinates from RapidOCR
-    #     img_bytes = pix.tobytes("png")
-    #     ocr_result, _ = rapid_engine(img_bytes)
-        
-    #     if not ocr_result:
-    #         return # No text found on this page
-            
-    #     # 3. Setup Tesserocr and loop through the boxes safely
-    #     with tesserocr.PyTessBaseAPI(lang=lang) as tess_api:
-    #         img_pil = Image.frombytes("RGB", [img_width, img_height], pix.samples) # type: ignore
-    #         tess_api.SetImage(img_pil)
-            
-    #         for dt_box in ocr_result:
-    #             # dt_box format: [ [[x1,y1], [x2,y2], [x3,y3], [x4,y4]], "text", confidence ]
-    #             box_coords = dt_box[0]
-                
-    #             x_coords = [p[0] for p in box_coords]
-    #             y_coords = [p[1] for p in box_coords]
-                
-    #             left = int(min(x_coords))
-    #             top = int(min(y_coords))
-    #             right = int(max(x_coords))
-    #             bottom = int(max(y_coords))
-                
-    #             # --- THE FIX: CLAMP COORDINATES TO IMAGE BOUNDS ---
-    #             left = max(0, min(left, img_width - 1))
-    #             top = max(0, min(top, img_height - 1))
-    #             right = max(0, min(right, img_width))
-    #             bottom = max(0, min(bottom, img_height))
-                
-    #             width = right - left
-    #             height = bottom - top
-                
-    #             # Skip invalid or 0-pixel boxes
-    #             if width <= 0 or height <= 0:
-    #                 continue
-                    
-    #             # 4. Extract Text with Tesseract using the safe rectangle
-    #             tess_api.SetRectangle(left, top, width, height)
-    #             text = tess_api.GetUTF8Text().strip()
-                
-    #             if text:
-    #                 # 5. Map coordinates back from the 300 DPI image to the PDF's point system (72 DPI)
-    #                 scale_x = page.rect.width / img_width
-    #                 scale_y = page.rect.height / img_height
-                    
-    #                 pdf_rect = pymupdf.Rect(
-    #                     left * scale_x, 
-    #                     top * scale_y, 
-    #                     right * scale_x, 
-    #                     bottom * scale_y
-    #                 )
-                    
-    #                 # 6. Inject the text invisibly into the PDF page 
-    #                 # render_mode=3 makes it an invisible, searchable text layer so pymupdf4llm can read it
-    #                 fontsize = max(4, pdf_rect.height * 0.8) # Approximate font size based on box height
-    #                 page.insert_text(
-    #                     pymupdf.Point(pdf_rect.x0, pdf_rect.y1), # Bottom-left of the bounding box
-    #                     text, 
-    #                     fontsize=fontsize,
-    #                     render_mode=3 
-    #                 )
-    
     def __enrichDocCreator(self, filePath: Path, pages: List[int]) -> BytesIO:
         with pymupdf.open(filePath) as src, pymupdf.open() as doc:
             for page in pages:
@@ -222,7 +148,9 @@ class PdfProcessor:
             buffer.seek(0)
             return buffer
 
-    def __imageExtractor(self, filePath: Path, imgbbox: dict, pagesState: dict, table=False):
+    def __imageExtractor(
+        self, filePath: Path, imgbbox: dict, pagesState: dict, table=False
+    ):
         doc = pymupdf.open(filePath)
 
         for page_no, bboxes in imgbbox.items():
@@ -232,7 +160,7 @@ class PdfProcessor:
             extractedPaths = []
 
             for idx, bbox in enumerate(bboxes):
-                TaborImg = 'image'
+                TaborImg = "image"
                 topNew = pageHeight - bbox.t
                 bottomNew = pageHeight - bbox.b
                 rect = pymupdf.Rect(bbox.l, topNew, bbox.r, bottomNew)
@@ -242,9 +170,7 @@ class PdfProcessor:
                 if table:
                     TaborImg = "table"
 
-                img_filename = (
-                    f"{pagesState[page_no]['book_uid']}_page_{page_no}_{TaborImg}_{idx}.png"
-                )
+                img_filename = f"{pagesState[page_no]['book_uid']}_page_{page_no}_{TaborImg}_{idx}.png"
                 img_filepath = Path("tmp") / img_filename
 
                 pix.save(str(img_filepath))
@@ -254,7 +180,6 @@ class PdfProcessor:
             pagesState[page_no]["img_path"] = extractedPaths
 
         doc.close()
-
 
     def __textExtractor(self, filePath: Path, pages: List[int]) -> List[Dict[str, Any]]:
         doc = pymupdf.open(filePath)
@@ -277,33 +202,92 @@ class PdfProcessor:
         )
         chunks = chunker.chunk(codeBlock["content"])
         return [chunk.text for chunk in chunks]
-    
+
     def __recursiveChunker(self, textBlock: str):
-        chunker = RecursiveChunker(tokenizer=tokenizerModel, chunk_size=800, rules=RecursiveRules())
+        chunker = RecursiveChunker(
+            tokenizer=tokenizerModel, chunk_size=800, rules=RecursiveRules()
+        )
         chunks = chunker.chunk(textBlock)
         return [chunk.text for chunk in chunks]
     
-    async def layoutMapper(self, doc, pagesMetaData: dict, imgBbox: defaultdict, tableBbox: defaultdict, failedPages: Optional[Set[int]] = None):
-        for item, _ in doc.document.iterate_items():
-                page_no = item.prov[0].page_no  # type: ignore
+    async def __rescueFailedLayouts(self, filePath: Path, failedPages: Set[int], analyzedPages: dict, imgBbox: defaultdict, tableBbox: defaultdict):
 
-                if failedPages and page_no in failedPages:
-                    continue
-                label = item.label  # type: ignore
-                if label == "picture":
-                    imgBbox[page_no].append(item.prov[0].bbox)  # type: ignore
-                    pagesMetaData[page_no]["required_deep"] = True
-                    pagesMetaData[page_no]["has_image"] = True
-                elif label == "table":
-                    tableBbox[page_no].append(item.prov[0].bbox) # type: ignore
-                    pagesMetaData[page_no]["has_table"] = True
-                    pagesMetaData[page_no]["required_deep"] = True
-                elif label == "formula":
-                    pagesMetaData[page_no]["has_formula"] = True
-                    pagesMetaData[page_no]["required_deep"] = True
-                elif label == "code":
-                    pagesMetaData[page_no]["has_code"] = True
-                    pagesMetaData[page_no]["required_deep"] = True
+        gc.collect()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        rescueOptions = ThreadedPdfPipelineOptions(
+            accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
+            do_table_structure=False,
+            do_ocr=False,
+            layout_batch_size=1
+        )
+
+        rescueAnalyzer = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(
+                    pipeline_options=rescueOptions,
+                    backend=DoclingParseDocumentBackend
+                )
+            }
+        )
+
+
+        async with asyncEngine.execution_options(isolation_level="AUTOCOMMIT").connect() as lock_conn:
+            await lock_conn.execute(text(f"SELECT pg_advisory_lock({GPU_LOCK})"))
+            rescueAnalyzer.initialize_pipeline(InputFormat.PDF)
+            try:
+                for failedPage in sorted(failedPages):
+                    try:
+                        doc = await asyncio.to_thread(
+                            rescueAnalyzer.convert,
+                            filePath,
+                            page_range=(failedPage, failedPage),
+                        )
+                        
+                        if doc and doc.status != ConversionStatus.FAILURE:
+                            await self.layoutMapper(doc, analyzedPages, imgBbox, tableBbox)
+                            
+                    except Exception as e:
+                        print(f"CRITICAL: Page {failedPage} failed even in safe mode: {e}")
+                    
+            finally:
+                try:
+                    await lock_conn.execute(text(f"SELECT pg_advisory_unlock({GPU_LOCK})"))
+                except Exception:
+                    pass
+
+        
+
+    async def layoutMapper(
+        self,
+        doc,
+        pagesMetaData: dict,
+        imgBbox: defaultdict,
+        tableBbox: defaultdict,
+        failedPages: Optional[Set[int]] = None,
+    ):
+        for item, _ in doc.document.iterate_items():
+            page_no = item.prov[0].page_no  # type: ignore
+
+            if failedPages and page_no in failedPages:
+                continue
+            label = item.label  # type: ignore
+            if label == "picture":
+                imgBbox[page_no].append(item.prov[0].bbox)  # type: ignore
+                pagesMetaData[page_no]["required_deep"] = True
+                pagesMetaData[page_no]["has_image"] = True
+            elif label == "table":
+                tableBbox[page_no].append(item.prov[0].bbox)  # type: ignore
+                pagesMetaData[page_no]["has_table"] = True
+                pagesMetaData[page_no]["required_deep"] = True
+            elif label == "formula":
+                pagesMetaData[page_no]["has_formula"] = True
+                pagesMetaData[page_no]["required_deep"] = True
+            elif label == "code":
+                pagesMetaData[page_no]["has_code"] = True
+                pagesMetaData[page_no]["required_deep"] = True
 
 
     async def layoutAnalyzer(self, filePath: Path, job: Job, session: AsyncSession):
@@ -320,7 +304,7 @@ class PdfProcessor:
                 )
             }
         )
-        redoc = None
+        doc = None
         enrichPages = set()
         analyzedPages = {}
         imgBbox = defaultdict(list)
@@ -340,22 +324,17 @@ class PdfProcessor:
 
                 failedPages: Set[int] = set()
 
-                if doc.status in (ConversionStatus.PARTIAL_SUCCESS, ConversionStatus.FAILURE):
+                if doc.status in (
+                    ConversionStatus.PARTIAL_SUCCESS,
+                    ConversionStatus.FAILURE,
+                ):
                     for error in doc.errors:
-                        match = re.search(r"pages? \[?(\d+)\]?", error.error_message, re.IGNORECASE)
+                        match = re.search(
+                            r"pages? \[?(\d+)\]?", error.error_message, re.IGNORECASE
+                        )
                         if match:
                             pageNum = int(match.group(1))
                             failedPages.add(pageNum)
-
-
-                if failedPages:
-                    pages = sorted(failedPages)
-                    redoc = await asyncio.to_thread(
-                        layout_analyser.convert,
-                        filePath,
-                        page_range=(pages[0], pages[-1])
-                    )
-
             finally:
                 try:
                     await lock_conn.execute(
@@ -377,18 +356,18 @@ class PdfProcessor:
                     "has_formula": False,
                     "has_code": False,
                 }
-                
+
         if failedPages:
-            await self.layoutMapper(doc, analyzedPages, imgBbox, tableBbox, failedPages)
-            await self.layoutMapper(redoc, analyzedPages, imgBbox, tableBbox)
+            if doc:
+                await self.layoutMapper(doc, analyzedPages, imgBbox, tableBbox, failedPages)
+                await self.__rescueFailedLayouts(filePath, failedPages, analyzedPages, imgBbox, tableBbox)
         else:
-            await self.layoutMapper(doc, analyzedPages, imgBbox, tableBbox)
+            if doc:
+                await self.layoutMapper(doc, analyzedPages, imgBbox, tableBbox)
 
         for page_no in range(job.page_start + 1, job.page_end + 2):
             if analyzedPages[page_no]["required_deep"]:
                 enrichPages.add(page_no)
-                
-
 
         if imgBbox:
             await asyncio.to_thread(
@@ -426,9 +405,31 @@ class PdfProcessor:
             return upserted_pages, enrichPages
         return [], []
 
-    async def pageExtractor(
-        self, pages: List[int], filePath: Path
+
+    async def getPrevPageChunk(
+        self, prevPageNo: int, bookUid: str, filepath: Path, session: AsyncSession
     ):
+        stmt = (
+            select(Chunk.chunk_data)
+            .where((Chunk.book_uid == bookUid) & (Chunk.page_no == prevPageNo))
+            .order_by(Chunk.chunk_index.desc())
+            .limit(1)
+        ) # type: ignore
+        res = await session.execute(stmt)
+        rawText = res.scalar_one_or_none()
+        if not rawText:
+            prevPageData = await self.pageExtractor([prevPageNo - 1], filepath)
+            if not prevPageData:
+                return ""
+            rawText = list(prevPageData.values())[0]["markdown"]
+        if len(rawText) > OVERLAP_CHUNK_LIMIT:
+            prefix = rawText[-OVERLAP_CHUNK_LIMIT:]
+            index = prefix.find(" ")
+            return prefix[index + 1 :] if index != -1 else prefix
+        return rawText
+
+
+    async def pageExtractor(self, pages: List[int], filePath: Path):
         md = OrderedDict()
         markdownDicts: List[Dict[str, Any]] = await asyncio.to_thread(
             self.__textExtractor, filePath, pages
@@ -452,14 +453,19 @@ class PdfProcessor:
                     result.append(page["text"][lastIndex:start])
                     lastIndex = end
                 result.append(page["text"][lastIndex:])
-                md[page["metadata"]["page_number"]] = {'markdown': "".join(result), 'code': []}
+                md[page["metadata"]["page_number"]] = {
+                    "markdown": "".join(result),
+                    "code": [],
+                }
             else:
-                md[page["metadata"]["page_number"]] = {'markdown': page["text"], 'code': []}
+                md[page["metadata"]["page_number"]] = {
+                    "markdown": page["text"],
+                    "code": [],
+                }
         return md
 
-    async def enrichedPageExtractor(
-        self, selectedPages: List[int], filePath: Path
-    ):
+
+    async def enrichedPageExtractor(self, selectedPages: List[int], filePath: Path):
         enrich_options = ThreadedPdfPipelineOptions(
             accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
             do_table_structure=True,
@@ -524,17 +530,23 @@ class PdfProcessor:
         buff.close()
         return md
 
+
     async def chunker(
-        self, session: AsyncSession, md: OrderedDict, job: Job, pages: Sequence[Page]
+        self,
+        session: AsyncSession,
+        md: OrderedDict,
+        job: Job,
+        pages: Sequence[Page],
+        rollingOverlap: str = "",
     ):
         pipeline = (
             Pipeline()
             .process_with("markdown", tokenizer=tokenizerModel)
             .chunk_with(
-                 "recursive",
-                 chunk_size=800,
-                 tokenizer=tokenizerModel,
-                 rules=RecursiveRules()
+                "recursive",
+                chunk_size=800,
+                tokenizer=tokenizerModel,
+                rules=RecursiveRules(),
             )
             .refine_with(
                 "overlap", tokenizer=tokenizerModel, context_size=100, method="prefix"
@@ -545,17 +557,29 @@ class PdfProcessor:
         codeBlocks = None
         pagesMap = {page.page_no: page for page in pages}
         chunksObj = defaultdict(list)
-        # localData = []
+        localData = []
+        rollingBuffer = rollingOverlap
         book_id = job.book_uid
         for page_no, pageData in md.items():
             currentPage = pagesMap.get(page_no)
             markdown = pageData["markdown"]
             if pageData["code"]:
                 codeBlocks = pageData["code"]
+
             if not markdown.strip():
                 continue
 
+            if rollingBuffer:
+                markdown = rollingBuffer + "\n\n" + markdown
+
             mdDoc = await pipeline.arun(markdown)
+
+            if len(markdown) > OVERLAP_CHUNK_LIMIT:
+                prefix = markdown[-OVERLAP_CHUNK_LIMIT:]
+                index = prefix.find(" ")
+                rollingBuffer = prefix[index + 1 :]
+            else:
+                rollingBuffer = markdown
 
             codeChunks = []
 
@@ -565,7 +589,9 @@ class PdfProcessor:
                         chunks = await asyncio.to_thread(self.__codeChunker, block)
                         codeChunks.extend(chunks)
                     else:
-                        chunks = await asyncio.to_thread(self.__recursiveChunker, block["content"])
+                        chunks = await asyncio.to_thread(
+                            self.__recursiveChunker, block["content"]
+                        )
                         codeChunks.extend(chunks)
 
             if isinstance(mdDoc, Document):
@@ -573,12 +599,14 @@ class PdfProcessor:
 
                 if codeChunks:
                     chunks.extend(codeChunks)
-                
-                if not chunks: 
+
+                if not chunks:
                     continue
 
                 vectors = await EmbeddingService.batchEmbedding(chunks)
-                stmt = select(Page.uid).where((Page.page_no == page_no) & (Page.book_uid == job.book_uid))  # type: ignore
+                stmt = select(Page.uid).where(
+                    (Page.page_no == page_no) & (Page.book_uid == job.book_uid)
+                )  # type: ignore
                 result = await session.execute(stmt)
                 page_uid = result.scalar_one_or_none()
                 pgChunks = []
@@ -591,12 +619,19 @@ class PdfProcessor:
                         user_uid=job.user_uid,
                         page_no=page_no,
                         chunk_index=index,
-                        chunk_data=chunk
-                    ) # type: ignore
+                        chunk_data=chunk,
+                    )  # type: ignore
                     pgChunks.append(data)
+                    localData.append(
+                        {
+                            "Chunk:": chunk,
+                            "Chunk Index:": index,
+                            "Page No:": page_no,
+                        }
+                    )
                 session.add_all(pgChunks)
                 await session.flush()
-                
+
                 for index in range(len(pgChunks)):
                     chunk = pgChunks[index]
                     payload = {
@@ -606,24 +641,28 @@ class PdfProcessor:
                         "chunk_uid": chunk.chunk_id,
                         "page_no": page_no,
                         "chunk_index": index,
-                        "has_image": currentPage.has_image, # type: ignore
-                        "has_table": currentPage.has_table, # type: ignore
+                        "has_image": currentPage.has_image,  # type: ignore
+                        "has_table": currentPage.has_table,  # type: ignore
                     }
                     payloads.append(payload)
                     template = f"{book_id}_page_{page_no}_chunk_{index}"
                     identity = uuid.uuid5(NAMESPACE_UID, template)
                     identifiers.append(identity)
 
-                await batchUpsert(asynClient, collection=VECTOR_COLLECTION, identifiers=identifiers, payloads=payloads, vectors=vectors)
+                await batchUpsert(
+                    asynClient,
+                    collection=VECTOR_COLLECTION,
+                    identifiers=identifiers,
+                    payloads=payloads,
+                    vectors=vectors,
+                )
                 chunksObj[page_no].extend(pgChunks)
-        # async with aiofiles.open('chunk-vector-01.json', 'w', encoding='utf-8') as file:
-        #      jsonData = json.dumps(localData, indent= 4)
-        #      await file.write(jsonData)
-        await session.commit()   
+        async with aiofiles.open("chunks-1706.json", "w", encoding="utf-8") as file:
+            jsonData = json.dumps(localData, indent=4)
+            await file.write(jsonData)
+        await session.commit()
         return chunksObj
 
-                
-                    
         # await session.execute(
         #         update(Page)
         #         .where(Page.page_no.in_(selectedPages)) # type: ignore
@@ -632,23 +671,111 @@ class PdfProcessor:
 
         # await session.flush()
 
+
     async def embedder(self, session: AsyncSession, chunk: str):
         model = ...
 
-    async def processor(self, job: Job, filepath: Path): 
+    async def processor(self, job: Job, filepath: Path):
+        initialOverlap = ""
         async with asyncSession() as session:
-            pagesObj, enrichPageSelected = await self.layoutAnalyzer(filepath, job, session)
+            pagesObj, enrichPageSelected = await self.layoutAnalyzer(
+                filepath, job, session
+            )
         if pagesObj and enrichPageSelected:
             normalPageSelected = []
             for num in range(job.page_start, job.page_end + 1):
                 if num + 1 not in enrichPageSelected:
                     normalPageSelected.append(num)
             textMd = await self.pageExtractor(normalPageSelected, filepath)
-            enrichMd = await self.enrichedPageExtractor(sorted(enrichPageSelected), filepath)
-            mergeItems = heapq.merge(textMd.items(), enrichMd.items(), key=lambda x: x[0])
+            enrichMd = await self.enrichedPageExtractor(
+                sorted(enrichPageSelected), filepath
+            )
+            mergeItems = heapq.merge(
+                textMd.items(), enrichMd.items(), key=lambda x: x[0]
+            )
             markdown = OrderedDict(mergeItems)
             async with asyncSession() as session:
-                chunksObj = await self.chunker(session, markdown, job, pagesObj)
-        
+                if job.page_start > 0:
+                    initialOverlap = await self.getPrevPageChunk(
+                        job.page_start, str(job.book_uid), filepath, session
+                    )
+                chunksObj = await self.chunker(
+                    session, markdown, job, pagesObj, initialOverlap
+                )
 
 
+# def __ocr_handler(self, page: pymupdf.Page, **kwargs):
+#     """
+#     Custom OCR handler that replaces rapidtess_api.exec_ocr.
+#     It intercepts the bounding boxes and clamps them to prevent Leptonica crashes.
+#     """
+#     # Get language from kwargs, defaulting to what you use in your textExtractor
+#     lang = kwargs.get("language", "eng+equ")
+
+#     # 1. Render the PDF page to a high-res image for OCR
+#     dpi = 300
+#     pix = page.get_pixmap(dpi=dpi)
+#     img_width, img_height = pix.width, pix.height
+
+#     # 2. Get bounding box coordinates from RapidOCR
+#     img_bytes = pix.tobytes("png")
+#     ocr_result, _ = rapid_engine(img_bytes)
+
+#     if not ocr_result:
+#         return # No text found on this page
+
+#     # 3. Setup Tesserocr and loop through the boxes safely
+#     with tesserocr.PyTessBaseAPI(lang=lang) as tess_api:
+#         img_pil = Image.frombytes("RGB", [img_width, img_height], pix.samples) # type: ignore
+#         tess_api.SetImage(img_pil)
+
+#         for dt_box in ocr_result:
+#             # dt_box format: [ [[x1,y1], [x2,y2], [x3,y3], [x4,y4]], "text", confidence ]
+#             box_coords = dt_box[0]
+
+#             x_coords = [p[0] for p in box_coords]
+#             y_coords = [p[1] for p in box_coords]
+
+#             left = int(min(x_coords))
+#             top = int(min(y_coords))
+#             right = int(max(x_coords))
+#             bottom = int(max(y_coords))
+
+#             # --- THE FIX: CLAMP COORDINATES TO IMAGE BOUNDS ---
+#             left = max(0, min(left, img_width - 1))
+#             top = max(0, min(top, img_height - 1))
+#             right = max(0, min(right, img_width))
+#             bottom = max(0, min(bottom, img_height))
+
+#             width = right - left
+#             height = bottom - top
+
+#             # Skip invalid or 0-pixel boxes
+#             if width <= 0 or height <= 0:
+#                 continue
+
+#             # 4. Extract Text with Tesseract using the safe rectangle
+#             tess_api.SetRectangle(left, top, width, height)
+#             text = tess_api.GetUTF8Text().strip()
+
+#             if text:
+#                 # 5. Map coordinates back from the 300 DPI image to the PDF's point system (72 DPI)
+#                 scale_x = page.rect.width / img_width
+#                 scale_y = page.rect.height / img_height
+
+#                 pdf_rect = pymupdf.Rect(
+#                     left * scale_x,
+#                     top * scale_y,
+#                     right * scale_x,
+#                     bottom * scale_y
+#                 )
+
+#                 # 6. Inject the text invisibly into the PDF page
+#                 # render_mode=3 makes it an invisible, searchable text layer so pymupdf4llm can read it
+#                 fontsize = max(4, pdf_rect.height * 0.8) # Approximate font size based on box height
+#                 page.insert_text(
+#                     pymupdf.Point(pdf_rect.x0, pdf_rect.y1), # Bottom-left of the bounding box
+#                     text,
+#                     fontsize=fontsize,
+#                     render_mode=3
+#                 )

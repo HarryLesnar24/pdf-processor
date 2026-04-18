@@ -5,6 +5,7 @@ from extractor import EmbeddingService, PdfProcessor
 import asyncio
 import uuid
 
+
 async def test():
     EmbeddingService.initialize()
     job = Job(
@@ -14,13 +15,12 @@ async def test():
         job_type=JobTypeEnum.focus,
         page_start=0,
         page_end=8,
-        dedupekey="test-key"
-
-    ) # type: ignore
+        dedupekey="test-key",
+    )  # type: ignore
     processor = PdfProcessor()
     filepath = Path("books/1706.03762v7.pdf")
     await processor.processor(job, filepath)
 
-if __name__=="__main__":
-    asyncio.run(test())
 
+if __name__ == "__main__":
+    asyncio.run(test())
