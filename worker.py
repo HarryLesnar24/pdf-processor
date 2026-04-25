@@ -4,12 +4,14 @@ import os
 import socket
 import asyncio
 import aiofiles
+import boto3
 from pathlib import Path
 from collections import deque
 from core_db.schemas.job import JobPriorityEnum
 from core_db.schemas.task import TaskStatusEnum
 from core_db.models.job import Job
 from core_db.models.book import Book
+from dotenv import load_dotenv
 from sqlalchemy import text, select
 from sqlalchemy.ext.asyncio.session import AsyncSession
 from tenacity import (
@@ -21,13 +23,32 @@ from tenacity import (
     RetryError,
     AsyncRetrying,
 )
-from extractor import EmbeddingService, PdfProcessor
+from typing import cast
+from extractor import PdfProcessor, tokenizerModel
+from core_ml.embedder.model import EmbeddingService
 from session import asyncSession
+from mypy_boto3_s3 import S3Client
 
+load_dotenv()
 
 PRIORITY_ORDER = [JobPriorityEnum.urgent, JobPriorityEnum.high, JobPriorityEnum.low]
 
+S3_BUCKET = os.getenv("S3_BUCKET")
+S3_ENDPOINT = os.getenv("S3_ENDPOINT")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_ACCESS_SECRET_KEY = os.getenv("AWS_ACCESS_SECRET_KEY")
+REGION = os.getenv("REGION")
+DOWNLOAD_FOLDER = os.getenv("DOWNLOAD_FOLDER")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
 
+
+assert REGION != None
+assert S3_BUCKET != None
+assert S3_ENDPOINT != None
+assert AWS_ACCESS_KEY_ID != None
+assert AWS_ACCESS_SECRET_KEY != None
+assert EMBEDDING_MODEL != None
+embedder = EmbeddingService()
 containerID = socket.gethostname()
 
 
@@ -90,33 +111,59 @@ async def hydrator(session: AsyncSession, worker_id: str):
     return jobs
 
 
-async def downloadFile(path: str):
-    # temporary
-    ...
+async def downloadFile(filename: str, s3Key: str, s3: S3Client, downloadFolder: Path):
+    assert S3_BUCKET != None
+    await asyncio.to_thread(
+        s3.download_file,
+        Bucket=S3_BUCKET,
+        Key=s3Key,
+        Filename=str(downloadFolder.absolute() / filename),
+    )
+
+
+async def checkFileExists(directory: Path, filename: str) -> bool:
+    if not directory.is_dir():
+        os.makedirs(directory, exist_ok=True)
+    filePath = directory / filename
+    if filePath.exists() and filePath.is_file():
+        return True
+    return False
 
 
 async def worker(container_id: str):
-    EmbeddingService.initialize()
+    assert DOWNLOAD_FOLDER != None
+    assert EMBEDDING_MODEL != None
+    s3 = cast(
+        S3Client,
+        boto3.client(
+            service_name="s3",
+            endpoint_url=S3_ENDPOINT,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_ACCESS_SECRET_KEY,
+            region_name=REGION,
+        ),
+    )
+    downloadFolder = Path(DOWNLOAD_FOLDER)
+    embedder.initialize(tokenizerModel, EMBEDDING_MODEL)
     print("Initialized Embedder")
-    waitingTime = 60
     localQueue = {}
     while True:
         try:
             async with asyncSession() as session:
                 assignedJobs = await hydrator(session, container_id)
+
                 print("Hydrated Job")
+
                 await session.commit()
 
             if not assignedJobs:
                 await asyncio.sleep(60)
                 continue
-            if waitingTime > 60:
-                waitingTime = 60
 
         except RetryError:
-            await asyncio.sleep(waitingTime)
-            waitingTime *= 2
+            await asyncio.sleep(60)
             continue
+
         book_ids = [job.book_uid for job in assignedJobs]
 
         async with asyncSession() as session:
@@ -124,11 +171,22 @@ async def worker(container_id: str):
                 select(Book.uid, Book.filepath).where(Book.uid.in_(book_ids))  # type: ignore
             )
             bookFileMap = {uid: path for uid, path in results.all()}
+
             print("Mapped Book UID with Filepath")
+
         for job in assignedJobs:
             filepath = bookFileMap.get(job.book_uid)
+
             if not filepath:
                 continue
+            filename = filepath.split("/")[-1]
+
+            if not await checkFileExists(downloadFolder, filename):
+                await downloadFile(filename, filepath, s3, downloadFolder)
+                print(f"Downloaded to the tmp folder {filename}")
+
+            filepath = downloadFolder.absolute() / filename
+
             if job.user_uid in localQueue:
                 localQueue[job.user_uid][job.priority].append(
                     (job.job_type, filepath, job)
@@ -151,16 +209,19 @@ async def worker(container_id: str):
 
         while userQueue:
             userUid = userQueue.popleft()
+
             print(f"Popped User: {userUid}")
+
             for priority in PRIORITY_ORDER:
                 queue = localQueue[userUid][priority]
 
                 if queue:
                     typeOfJob, path, jobObj = queue.popleft()
                     print(f"Path {path}, {jobObj.job_uid}")
-                    await pdfProcessor.processor(jobObj, path)
+                    await pdfProcessor.processor(jobObj, path, s3, embedder)
                     print("Completed Job")
                     break
+
             if any(localQueue[userUid].values()):
                 userQueue.append(userUid)
 
