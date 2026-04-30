@@ -1,6 +1,5 @@
 import io
 import gc
-import re
 from io import BytesIO
 import asyncio
 import heapq
@@ -13,16 +12,16 @@ import pymupdf.layout
 import pymupdf4llm
 from pymupdf4llm.ocr import rapidtess_api
 import torch
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio.session import AsyncSession
-from sqlmodel import text
 from core_ml.embedder.model import EmbeddingService
 from core_db.models.job import Job
 from core_db.models.page import Page
 from core_db.models.chunk import Chunk
 from core_db.schemas.task import TaskStatusEnum
 from core_db.schemas.page import PageIndexEnum, PageStatusEnum
+from core_db.schemas.book import BookStatusModel
 from core_db.vector.db import batchUpsert
 from transformers import AutoTokenizer
 from docling_core.types.io import DocumentStream
@@ -47,7 +46,6 @@ from session import asyncEngine, asyncSession
 from mypy_boto3_s3 import S3Client
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import aiofiles
-import logging
 import json
 import uuid
 
@@ -72,8 +70,61 @@ SPLIT_MARKER = "<!-- PAGE BREAK -->"
 
 asynClient = AsyncQdrantClient(host=QDRANT_HOST, port=int(QDRANT_PORT))
 tokenizerModel = AutoTokenizer.from_pretrained(EMBEDDING_MODEL)
+doclingCodeToChonkieCode = {"C++": 'cpp', 'C#': 'csharp', 'unknown': 'txt'}
 
+# embedder = EmbeddingService()
 
+class DoclingModel:
+    _layoutAnalyser = None
+    _enrichConverter = None
+
+    @classmethod
+    def layoutAnalyzer(cls):
+        if cls._layoutAnalyser is None:
+            layoutOptions = ThreadedPdfPipelineOptions(
+                accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
+                do_table_structure=False,
+                do_ocr=False,
+                layout_batch_size=2
+            )
+            cls._layoutAnalyser = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(
+                        pipeline_options=layoutOptions,
+                        backend=PyPdfiumDocumentBackend
+                    )
+                }
+            )
+            cls._layoutAnalyser.initialize_pipeline(InputFormat.PDF)
+        return cls._layoutAnalyser
+    
+    @classmethod
+    def enrichConverter(cls):
+        if cls._enrichConverter is None:
+            enrichOptions = ThreadedPdfPipelineOptions(
+                accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
+                do_table_structure=True,
+                do_formula_enrichment=True,
+                do_code_enrichment=True,
+                do_ocr=True,
+                code_formula_options=CodeFormulaVlmOptions.from_preset("codeformulav2"),
+                ocr_options=RapidOcrOptions(),
+                table_structure_options=TableStructureOptions(
+                    mode=TableFormerMode.ACCURATE, do_cell_matching=False
+                ),
+            )
+            cls._enrichConverter = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(
+                        backend=PyPdfiumDocumentBackend, 
+                        pipeline_options=enrichOptions
+                    )
+                }
+            )
+            cls._enrichConverter.initialize_pipeline(InputFormat.PDF)
+        return cls._enrichConverter
+    
+    
 class PdfProcessor:
     def __enrichDocCreator(self, filePath: Path, pages: List[int]) -> BytesIO:
         with pymupdf.open(filePath) as src, pymupdf.open() as doc:
@@ -87,7 +138,7 @@ class PdfProcessor:
             return buffer
 
     def __imageExtractor(
-        self, filePath: Path, imgbbox: dict, pagesState: dict, s3: S3Client, table=False
+        self, filePath: Path, imgbbox: dict, pagesState: dict, s3: S3Client, table=False, code=False
     ):
         assert S3_BUCKET != None
         doc = pymupdf.open(filePath)
@@ -103,23 +154,28 @@ class PdfProcessor:
 
                 pagesState[page_no].setdefault("img_path", [])
                 pagesState[page_no].setdefault("table_img_path", [])
+                pagesState[page_no].setdefault("code_img_path", [])
                 pageHeight = page.rect.height
 
                 for idx, bbox in enumerate(bboxes):
-                    TaborImg = "image"
                     topNew = pageHeight - bbox.t
                     bottomNew = pageHeight - bbox.b
                     rect = pymupdf.Rect(bbox.l, topNew, bbox.r, bottomNew)
                     rect.normalize()
                     pix = page.get_pixmap(clip=rect, dpi=300)
 
-                    if table:
-                        TaborImg = "table"
+                    if not table and not code:
+                        TaborImgorCod = "image"
+                    elif table:
+                        TaborImgorCod = "table"
+                    else:
+                        TaborImgorCod = "code"
+                    
                     userUid = pagesState[page_no]["user_uid"]
                     bookUid = pagesState[page_no]["book_uid"]
 
                     imgS3Key = (
-                        f"{userUid}/books/{bookUid}/page/{page_no}/{TaborImg}/{idx}.png"
+                        f"{userUid}/books/{bookUid}/page/{page_no}/{TaborImgorCod}/{idx}.png"
                     )
                     imgBytes = pix.tobytes("png")
 
@@ -137,10 +193,12 @@ class PdfProcessor:
                 try:
                     future.result()
                     pageNo = metaData["pageNo"]
-                    if not table:
+                    if not table and not code:
                         pagesState[pageNo]["img_path"].append(metaData["s3Key"])
-                    else:
+                    elif table:
                         pagesState[pageNo]["table_img_path"].append(metaData["s3Key"])
+                    else:
+                        pagesState[pageNo]["code_img_path"].append(metaData["s3Key"])
                 except Exception as e:
                     print(
                         f"❌ Failed to upload {metaData['pageNo']}, {metaData['s3Key']}: {e}"
@@ -161,21 +219,21 @@ class PdfProcessor:
         # assert isinstance(markdownDict, List)
         return markdownDict  # type: ignore
 
-    def __codeChunker(self, codeBlock: Dict[str, Any]):
-        chunker = CodeChunker(
-            language=codeBlock["language"].lower(),
-            tokenizer=tokenizerModel,
-            chunk_size=800,
-        )
-        chunks = chunker.chunk(codeBlock["content"])
-        return [chunk.text for chunk in chunks]
+    # def __codeChunker(self, codeBlock: Dict[str, Any]):
+    #     chunker = CodeChunker(
+    #         language=codeBlock["language"].lower(),
+    #         tokenizer=tokenizerModel,
+    #         chunk_size=800,
+    #     )
+    #     chunks = chunker.chunk(codeBlock["content"])
+    #     return [chunk.text for chunk in chunks]
 
-    def __recursiveChunker(self, textBlock: str):
-        chunker = RecursiveChunker(
-            tokenizer=tokenizerModel, chunk_size=800, rules=RecursiveRules()
-        )
-        chunks = chunker.chunk(textBlock)
-        return [chunk.text for chunk in chunks]
+    # def __recursiveChunker(self, textBlock: str):
+    #     chunker = RecursiveChunker(
+    #         tokenizer=tokenizerModel, chunk_size=800, rules=RecursiveRules()
+    #     )
+    #     chunks = chunker.chunk(textBlock)
+    #     return [chunk.text for chunk in chunks]
 
     async def __rescueFailedLayouts(
         self,
@@ -184,116 +242,138 @@ class PdfProcessor:
         analyzedPages: dict,
         imgBbox: defaultdict,
         tableBbox: defaultdict,
+        codeBbox: defaultdict
     ):
 
-        gc.collect()
+        # gc.collect()
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
-        print(f"Rescue Layout Analyzer {failedPages}")
+        print(f"Rescue Layout Analyzer Failed Pages {failedPages}")
 
-        rescueOptions = ThreadedPdfPipelineOptions(
-            accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
-            do_table_structure=False,
-            do_ocr=False,
-            layout_batch_size=1,
-        )
+        # rescueOptions = ThreadedPdfPipelineOptions(
+        #     accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
+        #     do_table_structure=False,
+        #     do_ocr=False,
+        #     layout_batch_size=1,
+        # )
 
-        rescueAnalyzer = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(
-                    pipeline_options=rescueOptions, backend=DoclingParseDocumentBackend
-                )
-            }
-        )
-
+        # rescueAnalyzer = DocumentConverter(
+        #     format_options={
+        #         InputFormat.PDF: PdfFormatOption(
+        #             pipeline_options=rescueOptions, backend=DoclingParseDocumentBackend
+        #         )
+        #     }
+        # )
+        rescueAnalyzer = DoclingModel.layoutAnalyzer()
         async with asyncEngine.execution_options(
             isolation_level="AUTOCOMMIT"
         ).connect() as lock_conn:
             await lock_conn.execute(text(f"SELECT pg_advisory_lock({GPU_LOCK})"))
-            rescueAnalyzer.initialize_pipeline(InputFormat.PDF)
+            # if torch.cuda.is_available():
+            #     torch.cuda.empty_cache()
+            # rescueAnalyzer.initialize_pipeline(InputFormat.PDF)
             try:
                 for failedPage in sorted(failedPages):
-                    doc = await asyncio.to_thread(
-                        rescueAnalyzer.convert,
-                        filePath,
-                        page_range=(failedPage, failedPage),
-                    )
+                    doc = None
+                    try:
+                        doc = await asyncio.to_thread(
+                            rescueAnalyzer.convert,
+                            filePath,
+                            page_range=(failedPage, failedPage),
+                        )
 
-                    for i, _ in doc.document.iterate_items():
-                        print(f"Rescued Page Number: {i.prov[0].page_no}")  # type: ignore
-                        break
+                        for i, _ in doc.document.iterate_items():
+                            print(f"Rescued Page Number: {i.prov[0].page_no}")  # type: ignore
+                            break
 
-                    await self.layoutMapper(doc, analyzedPages, imgBbox, tableBbox)
+                        await self.layoutMapper(doc, analyzedPages, imgBbox, tableBbox, codeBbox)
+                    finally:
+                        if doc:
+                            del doc
+                            gc.collect()
+                            torch.cuda.empty_cache()
 
             finally:
                 try:
                     await lock_conn.execute(
                         text(f"SELECT pg_advisory_unlock({GPU_LOCK})")
                     )
+
                 except Exception:
                     pass
 
     async def __rescueFailedEnrichPages(
         self,
-        codeMapper: defaultdict,
+        # codeMapper: defaultdict,
         markdown: OrderedDict,
         failedPages: set,
         filePath: Path,
     ):
-        rescueEnrichOptions = ThreadedPdfPipelineOptions(
-            accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
-            do_table_structure=True,
-            do_formula_enrichment=True,
-            do_code_enrichment=True,
-            do_ocr=True,
-            code_formula_options=CodeFormulaVlmOptions.from_preset("codeformulav2"),
-            ocr_options=RapidOcrOptions(),
-            table_structure_options=TableStructureOptions(
-                mode=TableFormerMode.ACCURATE, do_cell_matching=False
-            ),
-        )
+        # rescueEnrichOptions = ThreadedPdfPipelineOptions(
+        #     accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
+        #     do_table_structure=True,
+        #     do_formula_enrichment=True,
+        #     do_code_enrichment=True,
+        #     do_ocr=False,
+        #     code_formula_options=CodeFormulaVlmOptions.from_preset("codeformulav2"),
+        #     ocr_options=RapidOcrOptions(),
+        #     table_structure_options=TableStructureOptions(
+        #         mode=TableFormerMode.ACCURATE, do_cell_matching=False
+        #     ),
+        # )
 
-        rescueEnrichConverter = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(
-                    backend=DoclingParseDocumentBackend,
-                    pipeline_options=rescueEnrichOptions,
-                )
-            }
-        )
+        # rescueEnrichConverter = DocumentConverter(
+        #     format_options={
+        #         InputFormat.PDF: PdfFormatOption(
+        #             backend=DoclingParseDocumentBackend,
+        #             pipeline_options=rescueEnrichOptions,
+        #         )
+        #     }
+        # )
 
-        print(f"Rescue Enrich Converter {failedPages}")
+        # gc.collect()
+
+        rescueEnrichConverter = DoclingModel.enrichConverter()
+
+        print(f"Rescue Enrich Converter Failed Pages {failedPages}")
 
         async with asyncEngine.execution_options(
             isolation_level="AUTOCOMMIT"
         ).connect() as lock_conn:
             await lock_conn.execute(text(f"SELECT pg_advisory_lock({GPU_LOCK})"))
-            rescueEnrichConverter.initialize_pipeline(InputFormat.PDF)
+            # if torch.cuda.is_available():
+            #     torch.cuda.empty_cache()
+            # rescueEnrichConverter.initialize_pipeline(InputFormat.PDF)
             try:
                 for failedPage in sorted(failedPages):
-                    doc = await asyncio.to_thread(
-                        rescueEnrichConverter.convert,
-                        filePath,
-                        page_range=(failedPage, failedPage),
-                    )
+                    doc = None
+                    try:
+                        doc = await asyncio.to_thread(
+                            rescueEnrichConverter.convert,
+                            filePath,
+                            page_range=(failedPage, failedPage),
+                        )
 
-                    for item, _ in doc.document.iterate_items():
-                        if isinstance(item, CodeItem):  # type: ignore
-                            page = item.prov[0].page_no
-                            codeMapper[page].append(
-                                {
-                                    "language": item.code_language or "txt",
-                                    "content": item.text or None,
-                                    "bbox": item.prov[0].bbox,
-                                }
-                            )
-                    markdown[failedPage] = {
-                        "markdown": doc.document.export_to_markdown(),
-                        "code": codeMapper.get(failedPage, []),
-                        "enriched": True,
-                    }
+                        # for item, _ in doc.document.iterate_items():
+                        #     if isinstance(item, CodeItem):  # type: ignore
+                        #         page = item.prov[0].page_no
+                        #         codeMapper[page].append(
+                        #             {
+                        #                 "language": item.code_language.lower() if item.code_language not in doclingCodeToChonkieCode else doclingCodeToChonkieCode[item.code_language],
+                        #                 "content": item.text or None,
+                        #                 "bbox": item.prov[0].bbox,
+                        #             }
+                        #         )
+                        markdown[failedPage] = {
+                            "markdown": doc.document.export_to_markdown(),
+                            # "code": codeMapper.get(failedPage, []),
+                            "enriched": True,
+                        }
+                    finally:
+                        if doc:
+                            del doc
+                            gc.collect()
+                            torch.cuda.empty_cache()
 
             finally:
                 try:
@@ -309,6 +389,7 @@ class PdfProcessor:
         pagesMetaData: dict,
         imgBbox: defaultdict,
         tableBbox: defaultdict,
+        codeBbox: defaultdict,
         failedPages: Optional[Set[int]] = None,
     ):
         for item, _ in doc.document.iterate_items():
@@ -329,36 +410,44 @@ class PdfProcessor:
                 pagesMetaData[page_no]["has_formula"] = True
                 pagesMetaData[page_no]["required_deep"] = True
             elif label == "code":
+                codeBbox[page_no].append(item.prov[0].bbox) # type: ignore
                 pagesMetaData[page_no]["has_code"] = True
                 pagesMetaData[page_no]["required_deep"] = True
 
     async def layoutAnalyzer(
         self, filePath: Path, job: Job, session: AsyncSession, s3: S3Client
     ):
-        layout_options = ThreadedPdfPipelineOptions(
-            accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
-            do_table_structure=False,
-            do_ocr=False,
-            layout_batch_size=2,
-        )
-        layout_analyser = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(
-                    pipeline_options=layout_options, backend=DoclingParseDocumentBackend
-                )
-            }
-        )
+        # layout_options = ThreadedPdfPipelineOptions(
+        #     accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
+        #     do_table_structure=False,
+        #     do_ocr=False,
+        #     layout_batch_size=2,
+        # )
+        # layout_analyser = DocumentConverter(
+        #     format_options={
+        #         InputFormat.PDF: PdfFormatOption(
+        #             pipeline_options=layout_options, backend=DoclingParseDocumentBackend
+        #         )
+        #     }
+        # )
+
+        # gc.collect()
+
+        layout_analyser = DoclingModel.layoutAnalyzer()
         doc = None
         enrichPages = set()
         analyzedPages = {}
         imgBbox = defaultdict(list)
         tableBbox = defaultdict(list)
+        codeBbox = defaultdict(list)
         async with asyncEngine.execution_options(
             isolation_level="AUTOCOMMIT"
         ).connect() as lock_conn:
             await lock_conn.execute(text(f"SELECT pg_advisory_lock({GPU_LOCK})"))
             try:
-                layout_analyser.initialize_pipeline(InputFormat.PDF)
+                # if torch.cuda.is_available():
+                #     torch.cuda.empty_cache()
+                # layoutAnalyser.initialize_pipeline(InputFormat.PDF)
 
                 doc = await asyncio.to_thread(
                     layout_analyser.convert,
@@ -402,34 +491,38 @@ class PdfProcessor:
         if failedPages:
             if doc:
                 await self.layoutMapper(
-                    doc, analyzedPages, imgBbox, tableBbox, failedPages
+                    doc, analyzedPages, imgBbox, tableBbox, codeBbox, failedPages
                 )
                 await self.__rescueFailedLayouts(
-                    filePath, failedPages, analyzedPages, imgBbox, tableBbox
+                    filePath, failedPages, analyzedPages, imgBbox, tableBbox, codeBbox
                 )
         else:
             if doc:
-                await self.layoutMapper(doc, analyzedPages, imgBbox, tableBbox)
+                await self.layoutMapper(doc, analyzedPages, imgBbox, tableBbox, codeBbox)
+        
+        del doc
+        gc.collect()
+        torch.cuda.empty_cache()
 
         for page_no in range(job.page_start + 1, job.page_end + 2):
             if analyzedPages[page_no]["required_deep"]:
                 enrichPages.add(page_no)
 
         if imgBbox:
-            with open("img.json", "w", encoding="utf-8") as f:
-                serializable = {
-                    k: [bbox.__dict__ for bbox in v] for k, v in imgBbox.items()
-                }
-                json.dump(serializable, f, indent=4)
+            # with open("img.json", "w", encoding="utf-8") as f:
+            #     serializable = {
+            #         k: [bbox.__dict__ for bbox in v] for k, v in imgBbox.items()
+            #     }
+            #     json.dump(serializable, f, indent=4)
             await asyncio.to_thread(
                 self.__imageExtractor, filePath, imgBbox, analyzedPages, s3
             )
         if tableBbox:
-            with open("table.json", "w", encoding="utf-8") as f:
-                serializable = {
-                    k: [bbox.__dict__ for bbox in v] for k, v in tableBbox.items()
-                }
-                json.dump(serializable, f, indent=4)
+            # with open("table.json", "w", encoding="utf-8") as f:
+            #     serializable = {
+            #         k: [bbox.__dict__ for bbox in v] for k, v in tableBbox.items()
+            #     }
+            #     json.dump(serializable, f, indent=4)
             await asyncio.to_thread(
                 self.__imageExtractor,
                 filePath,
@@ -437,6 +530,16 @@ class PdfProcessor:
                 analyzedPages,
                 s3,
                 table=True,
+            )
+        
+        if codeBbox:
+            await asyncio.to_thread(
+                self.__imageExtractor,
+                filePath,
+                codeBbox,
+                analyzedPages,
+                s3,
+                code=True
             )
 
         batchData = []
@@ -457,6 +560,7 @@ class PdfProcessor:
                 "status": stmt.excluded.status,
                 "img_path": stmt.excluded.img_path,
                 "table_img_path": stmt.excluded.table_img_path,
+                "code_img_path": stmt.excluded.code_img_path,
                 "updated_at": func.now(),
             },
         ).returning(Page)
@@ -516,40 +620,44 @@ class PdfProcessor:
                 result.append(page["text"][lastIndex:])
                 md[page["metadata"]["page_number"]] = {
                     "markdown": "".join(result),
-                    "code": [],
+                    # "code": [],
                     "enriched": False,
                 }
             else:
                 md[page["metadata"]["page_number"]] = {
                     "markdown": page["text"],
-                    "code": [],
+                    # "code": [],
                     "enriched": False,
                 }
         return md
 
     async def enrichedPageExtractor(self, selectedPages: List[int], filePath: Path):
-        enrich_options = ThreadedPdfPipelineOptions(
-            accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
-            do_table_structure=True,
-            do_formula_enrichment=True,
-            do_code_enrichment=True,
-            do_ocr=True,
-            code_formula_options=CodeFormulaVlmOptions.from_preset("codeformulav2"),
-            ocr_options=RapidOcrOptions(),
-            table_structure_options=TableStructureOptions(
-                mode=TableFormerMode.ACCURATE, do_cell_matching=False
-            ),
-        )
+        # enrich_options = ThreadedPdfPipelineOptions(
+        #     accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA),
+        #     do_table_structure=True,
+        #     do_formula_enrichment=True,
+        #     do_code_enrichment=True,
+        #     do_ocr=False,
+        #     code_formula_options=CodeFormulaVlmOptions.from_preset("codeformulav2"),
+        #     ocr_options=RapidOcrOptions(),
+        #     table_structure_options=TableStructureOptions(
+        #         mode=TableFormerMode.ACCURATE, do_cell_matching=False
+        #     ),
+        # )
 
-        enrich_converter = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(
-                    backend=DoclingParseDocumentBackend, pipeline_options=enrich_options
-                )
-            }
-        )
+        # enrich_converter = DocumentConverter(
+        #     format_options={
+        #         InputFormat.PDF: PdfFormatOption(
+        #             backend=DoclingParseDocumentBackend, pipeline_options=enrich_options
+        #         )
+        #     }
+        # )
 
         md = OrderedDict()
+
+        # gc.collect()
+
+        enrich_converter = DoclingModel.enrichConverter()
 
         pageMapper = {i + 1: actualNo for i, actualNo in enumerate(selectedPages)}
         buff = await asyncio.to_thread(self.__enrichDocCreator, filePath, selectedPages)
@@ -558,31 +666,38 @@ class PdfProcessor:
             isolation_level="AUTOCOMMIT"
         ).connect() as lock_conn:
             await lock_conn.execute(text(f"SELECT pg_advisory_lock({GPU_LOCK})"))
-            enrich_converter.initialize_pipeline(InputFormat.PDF)
+            # if torch.cuda.is_available():
+            #     torch.cuda.empty_cache()
+            # enrich_converter.initialize_pipeline(InputFormat.PDF)
             try:
                 doc = await asyncio.to_thread(enrich_converter.convert, stream)
             finally:
                 await lock_conn.execute(text(f"SELECT pg_advisory_unlock({GPU_LOCK})"))
+                
 
-        codeMaps = defaultdict(list)
+        # codeMaps = defaultdict(list)
         failedPages = set()
         requestedPages = set(selectedPages)
         successfullPages = set()
 
         for item, _ in doc.document.iterate_items():
-            if isinstance(item, CodeItem):  # type: ignore
-                page = item.prov[0].page_no
-                codeMaps[pageMapper[page]].append(
-                    {
-                        "language": item.code_language or "txt",
-                        "content": item.text or None,
-                        "bbox": item.prov[0].bbox,
-                    }
-                )
             page = pageMapper[item.prov[0].page_no]  # type: ignore
             successfullPages.add(page)
+            # if isinstance(item, CodeItem):  # type: ignore
+            #     page = item.prov[0].page_no
+                
+            #     codeMaps[pageMapper[page]].append(
+
+            #         {
+            #             "language": item.code_language.lower() if item.code_language not in doclingCodeToChonkieCode else doclingCodeToChonkieCode[item.code_language],
+            #             "content": item.text or None,
+            #             "bbox": item.prov[0].bbox,
+            #         }
+                
+            #     )
 
         failedPages = requestedPages - successfullPages
+        print(f"Failed Enrich Pages: {failedPages}")
 
         markdownFile = doc.document.export_to_markdown(
             page_break_placeholder=SPLIT_MARKER
@@ -594,14 +709,17 @@ class PdfProcessor:
             print(f"Enriched Pages By Docling: {actualPageNo}")
             md[actualPageNo] = {
                 "markdown": pages[page_no - 1],
-                "code": codeMaps.get(actualPageNo, []),
+                # "code": codeMaps.get(actualPageNo, []),
                 "enriched": True,
             }
 
-        if failedPages:
-            await self.__rescueFailedEnrichPages(codeMaps, md, failedPages, filePath)
-
         buff.close()
+        del doc
+        gc.collect()
+        torch.cuda.empty_cache()
+        if failedPages:
+            await self.__rescueFailedEnrichPages(md, failedPages, filePath)
+
         return md
 
     async def chunker(
@@ -613,6 +731,7 @@ class PdfProcessor:
         embedder: EmbeddingService,
         rollingOverlap: str = "",
     ):
+
         pipeline = (
             Pipeline()
             .process_with("markdown", tokenizer=tokenizerModel)
@@ -627,7 +746,10 @@ class PdfProcessor:
             )
         )
 
+        gc.collect()
+
         assert VECTOR_COLLECTION != None
+        assert EMBEDDING_MODEL != None
         pagesMap = {page.page_no: page for page in pages}
         chunksObj = defaultdict(list)
         localData = []
@@ -638,7 +760,7 @@ class PdfProcessor:
             assert currentPage != None
             print(f"Chonkie Chunking the Page: {currentPage}")
             markdown = pageData["markdown"]
-            codeBlocks = pageData["code"]
+            # codeBlocks = pageData["code"]
 
             if not markdown.strip():
                 continue
@@ -659,24 +781,28 @@ class PdfProcessor:
             else:
                 rollingBuffer = markdown
 
-            codeChunks = []
+            # codeChunks = []
 
-            if codeBlocks:
-                for block in codeBlocks:
-                    if block["language"] != "txt":
-                        chunks = await asyncio.to_thread(self.__codeChunker, block)
-                        codeChunks.extend(chunks)
-                    else:
-                        chunks = await asyncio.to_thread(
-                            self.__recursiveChunker, block["content"]
-                        )
-                        codeChunks.extend(chunks)
+            # if codeBlocks:
+            #     for block in codeBlocks:
+            #         content = block.get("content")
+            #         language = block.get("language", "txt")
+
+            #         if not content or not content.strip():
+            #             continue
+
+            #         if language != "txt":
+            #             chunks = await asyncio.to_thread(self.__codeChunker, block)
+            #         else:
+            #             chunks = await asyncio.to_thread(self.__recursiveChunker, content)
+
+            #         codeChunks.extend(chunks)
 
             if isinstance(mdDoc, Document):
                 chunks = [chunk.text for chunk in mdDoc.chunks]
 
-                if codeChunks:
-                    chunks.extend(codeChunks)
+                # if codeChunks:
+                #     chunks.extend(codeChunks)
 
                 if not chunks:
                     continue
@@ -721,12 +847,16 @@ class PdfProcessor:
                         "chunk_index": index,
                         "has_image": currentPage.has_image,  # type: ignore
                         "has_table": currentPage.has_table,  # type: ignore
+                        "has_code": currentPage.has_code, # type: ignore
                         "img_s3keys": currentPage.img_path
                         if currentPage.has_image
                         else None,  # type: ignore
                         "table_s3keys": currentPage.table_img_path
                         if currentPage.has_table
                         else None,  # type: ignore
+                        "code_s3keys": currentPage.code_img_path
+                        if currentPage.has_code 
+                        else None
                     }
                     payloads.append(payload)
                     template = f"{book_id}_page_{page_no}_chunk_{index}"
@@ -743,39 +873,65 @@ class PdfProcessor:
                 currentPage.status = PageStatusEnum.complete
                 chunksObj[page_no].extend(pgChunks)
                 await session.merge(currentPage)
-        async with aiofiles.open("chunks-1706.json", "w", encoding="utf-8") as file:
+        async with aiofiles.open("chunks-C#.json", "a", encoding="utf-8") as file:
             jsonData = json.dumps(localData, indent=4)
             await file.write(jsonData)
-        job.task_status = TaskStatusEnum.done
         await session.merge(job)
+        job.task_status = TaskStatusEnum.done
+        await session.flush()
+        stmt = text("""
+            UPDATE books
+            SET status = :state
+            WHERE uid = :book_uid
+            AND NOT EXISTS (
+                    SELECT 1 FROM jobs
+                    WHERE book_uid = :book_uid
+                    AND task_status IN ('queued', 'running', 'failed', 'cancelled')
+                    )
+""")
+        
+        await session.execute(stmt, {"book_uid": job.book_uid, "state": BookStatusModel.ready_full})
         await session.commit()
         return chunksObj
 
         
     async def processor(self, job: Job, filepath: Path, s3: S3Client, embedder: EmbeddingService):
-        print("Processor Started")
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        initialOverlap = ""
-        async with asyncSession() as session:
-            pagesObj, enrichPageSelected = await self.layoutAnalyzer(
-                filepath, job, session, s3
-            )
-        if pagesObj and enrichPageSelected:
-            normalPageSelected = []
-            for num in range(job.page_start, job.page_end + 1):
-                if num + 1 not in enrichPageSelected:
-                    normalPageSelected.append(num)
-            textMd = await self.pageExtractor(normalPageSelected, filepath)
-            enrichMd = await self.enrichedPageExtractor(
-                sorted(enrichPageSelected), filepath
-            )
-            mergeItems = heapq.merge(
-                textMd.items(), enrichMd.items(), key=lambda x: x[0]
-            )
-            markdown = OrderedDict(mergeItems)
-            try:
+        try:
+            print("=== JOB START ===")
+            print(torch.cuda.memory_allocated() / 1024**2, "MB allocated")
+            print(torch.cuda.memory_reserved() / 1024**2, "MB reserved")
+            assert EMBEDDING_MODEL != None
+            print("Processor Started")
+            initialOverlap = ""
+            async with asyncSession() as session:
+                pagesObj, enrichPageSelected = await self.layoutAnalyzer(
+                    filepath, job, session, s3
+                )
+            print("=== After LayoutAnalyzer ===")
+            print(torch.cuda.memory_allocated() / 1024**2, "MB allocated")
+            print(torch.cuda.memory_reserved() / 1024**2, "MB reserved")
+            if pagesObj and enrichPageSelected:
+                normalPageSelected = []
+                for num in range(job.page_start, job.page_end + 1):
+                    if num + 1 not in enrichPageSelected:
+                        normalPageSelected.append(num)
+                textMd = await self.pageExtractor(normalPageSelected, filepath)
+                enrichMd = await self.enrichedPageExtractor(
+                    sorted(enrichPageSelected), filepath
+                )
+                print("=== After EnrichedPageExtractor ===")
+                print(torch.cuda.memory_allocated() / 1024**2, "MB allocated")
+                print(torch.cuda.memory_reserved() / 1024**2, "MB reserved")
+                jobsPagesTotal = len(range(job.page_start + 1, job.page_end + 2))
+                pagesProcessed = len(textMd) + len(enrichMd)
+                # assert jobsPagesTotal == pagesProcessed
+                print(f'JobsAssignedPagesTotal: {jobsPagesTotal}\nPagesProcessedTotal: {pagesProcessed}')
+    
+                mergeItems = heapq.merge(
+                    textMd.items(), enrichMd.items(), key=lambda x: x[0]
+                )
+                markdown = OrderedDict(mergeItems)
+            
                 async with asyncSession() as session:
                     if job.page_start > 0:
                         initialOverlap = await self.getPrevPageChunk(
@@ -784,9 +940,21 @@ class PdfProcessor:
                     chunksObj = await self.chunker(
                         session, markdown, job, pagesObj, embedder, initialOverlap
                     )
+                print("=== After Chunker ===")
+                print(torch.cuda.memory_allocated() / 1024**2, "MB allocated")
+                print(torch.cuda.memory_reserved() / 1024**2, "MB reserved")
+        except Exception as e:
+                    print(f"Job Failed {e}")
+        finally:
+                gc.collect()
+                torch.cuda.ipc_collect()
+                torch.cuda.empty_cache()
+                print("=== JOB END ===")
+                print(torch.cuda.memory_allocated() / 1024**2, "MB allocated")
+                print(torch.cuda.memory_reserved() / 1024**2, "MB reserved")
 
-            finally:
-                embedder.teardown()
+
+
 
 
     

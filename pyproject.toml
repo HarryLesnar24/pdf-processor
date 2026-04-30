@@ -23,7 +23,7 @@ dependencies = [
     "tenacity>=9.1.4",
     "tesserocr>=2.10.0",
     "torch>=2.11.0",
-    "transformers>=4.57.6",
+    "transformers>=4.57.5",
     "triton-windows>=3.6.0.post26",
 ]
 
